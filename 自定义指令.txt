@@ -1,0 +1,5 @@
+con
+show fan
+show tem
+fan speed percent 90
+sa

@@ -1,0 +1,8 @@
+{
+    "host_file": "host-stna.csv",
+    "result_file": "result.txt",
+    "washed_file": "washed_rec.csv",
+    "report_file": "巡检报告-{datetime}.csv",
+    "lldp_file": "LLDP邻居报告.csv",
+    "topo_file": "topology.html"
+}

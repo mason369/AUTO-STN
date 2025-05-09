@@ -1,0 +1,12 @@
+screen-length 512
+show device
+show temperature
+show fan
+show laser
+show interface main
+show ospf neighbor brief
+show ldp session
+show mpls l2vc brief
+show bfd session brief
+show alarm current
+screen-length 25
