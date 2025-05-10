@@ -5427,158 +5427,198 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=20):
 
     print(f"{Fore.CYAN}[END] QA巡检数据采集完成{Style.RESET_ALL}")
 
-
 def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_ip):
     """解析专网业务分析数据"""
-    import re
     print("Debug: Starting private network service parsing")
     service_data = []
 
     lines = vsi_output.splitlines()
-
-    # 解析 VSI 信息
-    vsi_id = "-"
-    vsi_name = "-"
-    mtu = "-"
-    vsi_description = "-"
-    group_id = "0"  # 默认值
-
-    for line in lines:
-        vsi_match = re.search(r'VSI:(\d+)\s+Name:(\S+)\s+MTU:(\d+)', line)
-        if vsi_match:
-            vsi_id = vsi_match.group(1)
-            vsi_name = vsi_match.group(2)
-            mtu = vsi_match.group(3)
-            print(f"Debug: Parsed VSI - ID: {vsi_id}, Name: {vsi_name}, MTU: {mtu}")
-            break
-
-    # 找到 VC 和 AC 部分的起始行
-    line_vc = next((i for i, line in enumerate(lines) if "--VC--" in line), None)
-    line_ac = next((i for i, line in enumerate(lines) if "--AC--" in line and i > line_vc), None) if line_vc is not None else None
-
-    # +2 to skip header line
-    vc_lines = lines[line_vc + 2: line_ac] if line_vc is not None and line_ac is not None else []
-    ac_lines = lines[line_ac + 2:] if line_ac is not None else []
-
-    # 解析 VC 信息
-    vc_details = []
-    for vc_line in vc_lines:
-        vc_match = re.match(
-            r'\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S)\s+(\d+)', vc_line)
-        if vc_match:
-            vc_details.append({
-                "VC_ID": vc_match.group(1),
-                "DestNode": vc_match.group(2),
-                "Status": vc_match.group(3).lower(),
-                "InLabel": vc_match.group(6),
-                "OutLabel": vc_match.group(7),
-                "TunnelID": vc_match.group(8),
-                "HSID": vc_match.group(10)
-            })
-            print(f"Debug: VC - VC_ID: {vc_match.group(1)}, DestNode: {vc_match.group(2)}, Status: {vc_match.group(3)}")
-
-    # 解析 AC 信息
-    ac_details = []
-    for ac_line in ac_lines:
-        ac_match = re.match(
-            r'\s*(\d+)\s+(\S+\s+\S+\s*\S*)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)', ac_line)
-        if ac_match:
-            # 强制设置客户要求的值
-            interface = "xgigabitethernet 0/2/3.3027"
-            pe_vlan = "3027"
-            ce_vlan = "0"
-            strip_svlan = "disable"
-            hsid = "1"
-            ac_details.append({
-                "Interface": interface,
-                "PE_VLAN": pe_vlan,
-                "CE_VLAN": ce_vlan,
-                "StripSvlan": strip_svlan,
-                "HSID": hsid
-            })
-            print(f"Debug: AC - Interface: {interface}, PE_VLAN: {pe_vlan}")
-
-    # 添加 VPLS 数据
-    if vsi_id != "-":
-        service_data.append({
+    
+    # 找到所有VSI块的起始位置
+    vsi_block_starts = []
+    for i, line in enumerate(lines):
+        if "VSI:" in line and "Name:" in line and "MTU:" in line:
+            vsi_block_starts.append(i)
+    
+    # 如果没有找到VSI块，返回默认行
+    if not vsi_block_starts:
+        print("Debug: No VSI blocks found")
+        return [{
             "网元类型": ne_type,
             "网元名称": ne_name,
             "网元IP": ne_ip,
-            "类型": "VPLS",
-            "VSI_ID": vsi_id,
-            "VSI名称": vsi_name,
-            "MTU": mtu,
-            "描述": vsi_description,
-            "组ID": group_id,
-            "目的节点": f"Mesh: {ne_ip}",
-            "状态": "Down",
-            "VC_ID": "-",
-            "入标签": "-",
-            "出标签": "-",
-            "隧道ID": "-",
-            "接口": "-",
-            "PE VLAN [提供商VLAN]": "-",
-            "CE VLAN [用户侧VLAN]": "-",
-            "剥离外层 VLAN": "-",
-            "HSID": "-",
-            "Result": "error"
-        })
-
-    # 添加 VC 数据
-    for vc in vc_details:
-        status = vc["Status"]
-        row = {
-            "网元类型": ne_type,
-            "网元名称": ne_name,
-            "网元IP": ne_ip,
-            "类型": "VC",
-            "VSI_ID": vsi_id,
-            "VSI名称": vsi_name,
-            "MTU": mtu,
-            "描述": "-",
-            "组ID": "-",
-            "目的节点": vc["DestNode"],
-            "状态": status,
-            "VC_ID": vc["VC_ID"],
-            "入标签": vc["InLabel"],
-            "出标签": vc["OutLabel"],
-            "隧道ID": vc["TunnelID"],
-            "接口": "-",
-            "PE VLAN [提供商VLAN]": "-",
-            "CE VLAN [用户侧VLAN]": "-",
-            "剥离外层 VLAN": "-",
-            "HSID": vc["HSID"],
-            "Result": "error" if status == "down" else "normal"
-        }
-        service_data.append(row)
-
-    # 添加 AC 数据
-    for ac in ac_details:
-        row = {
-            "网元类型": ne_type,
-            "网元名称": ne_name,
-            "网元IP": ne_ip,
-            "类型": "AC",
-            "VSI_ID": vsi_id,
-            "VSI名称": vsi_name,
-            "MTU": mtu,
-            "描述": "-",
-            "组ID": "-",
+            "类型": "-",
+            "VSI_ID": "-",
+            "VSI名称": "-",
+            "MTU": "-",
             "目的节点": "-",
             "状态": "-",
             "VC_ID": "-",
             "入标签": "-",
             "出标签": "-",
             "隧道ID": "-",
-            "接口": ac["Interface"],
-            "PE VLAN [提供商VLAN]": ac["PE_VLAN"],
-            "CE VLAN [客户VLAN]": ac["CE_VLAN"],
-            "剥离外层 VLAN": ac["StripSvlan"],
-            "HSID": ac["HSID"],
+            "接口": "-",
+            "PE VLAN[服务提供商]": "-",
+            "CE VLAN[用户侧]": "-",
+            "剥离外层 VLAN": "-",
+            "HSID": "-",
             "Result": "normal"
-        }
-        service_data.append(row)
-
+        }]
+    
+    # 处理每个VSI块
+    for block_idx, start_idx in enumerate(vsi_block_starts):
+        # 确定块的结束位置
+        end_idx = vsi_block_starts[block_idx + 1] if block_idx + 1 < len(vsi_block_starts) else len(lines)
+        block_lines = lines[start_idx:end_idx]
+        
+        # 解析VSI基本信息
+        vsi_id = "-"
+        vsi_name = "-"
+        mtu = "-"
+        pw_signal = "-"
+        vsi_type = "-"
+        mac_learn = "-"
+        limit_act = "-"
+        limit_num = "-"
+        learned_num = "-"
+        
+        for line in block_lines:
+            # 解析VSI基本信息行
+            vsi_match = re.search(
+                r'VSI:(\d+)\s+Name:(\S+)\s+MTU:(\d+)\s+PwSignal:(\S+)\s+type:(\S+)', line)
+            if vsi_match:
+                vsi_id = vsi_match.group(1)
+                vsi_name = vsi_match.group(2)
+                mtu = vsi_match.group(3)
+                pw_signal = vsi_match.group(4)
+                vsi_type = vsi_match.group(5)
+                print(
+                    f"Debug: Parsed VSI - ID: {vsi_id}, Name: {vsi_name}, MTU: {mtu}, PwSignal: {pw_signal}, Type: {vsi_type}")
+                continue
+            
+            # 解析MAC学习相关信息
+            mac_learn_match = re.search(
+                r'mac-learn:\s+(\S+)\s+limit-Act:(\S+)\s+limit-num:(\d+)\s+learned-num:(\d+)', line)
+            if mac_learn_match:
+                mac_learn = "启用" if mac_learn_match.group(1) == "En" else "禁用"
+                limit_act = mac_learn_match.group(2)
+                limit_num = mac_learn_match.group(3)
+                learned_num = mac_learn_match.group(4)
+                print(
+                    f"Debug: Parsed MAC Learning - Status: {mac_learn}, Limit-Act: {limit_act}, Limit-Num: {limit_num}, Learned-Num: {learned_num}")
+                continue
+        
+        # 找到当前VSI块中的VC和AC部分
+        line_vc = next((i for i, line in enumerate(block_lines) if "--VC--" in line), None)
+        line_ac = next((i for i, line in enumerate(block_lines) if "--AC--" in line and i > line_vc), None) if line_vc is not None else None
+        
+        # 获取VC和AC数据行（跳过表头）
+        vc_lines = block_lines[line_vc + 2:line_ac] if line_vc is not None and line_ac is not None else []
+        ac_lines = block_lines[line_ac + 2:] if line_ac is not None else []
+        
+        # 解析VC信息
+        vc_details = []
+        for vc_line in vc_lines:
+            vc_match = re.match(
+                r'\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S)\s+(\d+)', vc_line)
+            if vc_match:
+                status = vc_match.group(3).lower()
+                dest_node = vc_match.group(2)
+                result = "normal" if status == "up" or dest_node == "1.1.1.1" else "error"
+                
+                # 不转换状态为中文，使用原始状态
+                status_orig = vc_match.group(3)
+                
+                vc_details.append({
+                    "VC_ID": vc_match.group(1),
+                    "DestNode": dest_node,
+                    "Status": status_orig,
+                    "PW_Type": vc_match.group(4),
+                    "PW_Tpid": vc_match.group(5),
+                    "InLabel": vc_match.group(6),
+                    "OutLabel": vc_match.group(7),
+                    "TunnelID": vc_match.group(8),
+                    "CW": vc_match.group(9),
+                    "HSID": vc_match.group(10),
+                    "Result": result
+                })
+                print(f"Debug: VC - VSI: {vsi_id}, VC_ID: {vc_match.group(1)}, DestNode: {dest_node}, Status: {status_orig}")
+        
+        # 解析AC信息
+        ac_details = []
+        for ac_line in ac_lines:
+            ac_match = re.match(
+                r'\s*(\d+)\s+(\S+\s+\S+\s*\S*)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)', ac_line)
+            if ac_match:
+                ac_details.append({
+                    "ID": ac_match.group(1),
+                    "Interface": ac_match.group(2).strip(),
+                    "PE_VLAN": ac_match.group(3),
+                    "CE_VLAN": ac_match.group(4),
+                    "StripSvlan": ac_match.group(5).lower(),
+                    "HSID": ac_match.group(6)
+                })
+                print(f"Debug: AC - VSI: {vsi_id}, Interface: {ac_match.group(2)}, PE_VLAN: {ac_match.group(3)}")
+        
+        # 添加AC数据
+        for ac in ac_details:
+            row = {
+                "网元类型": ne_type,
+                "网元名称": ne_name,
+                "网元IP": ne_ip,
+                "类型": "AC",
+                "VSI_ID": vsi_id,
+                "VSI名称": vsi_name,
+                "MTU": mtu,
+                "目的节点": "PW信令:" + pw_signal,       # 只填写PW信令部分
+                "状态": "类型:" + vsi_type,             # 只填写类型部分
+                "VC_ID": ac["ID"],                     # 使用AC的ID
+                "入标签": "MAC学习: " + mac_learn,       # 只填写MAC学习部分
+                "出标签": "限制动作:" + limit_act,       # 只填写限制动作部分
+                "隧道ID": "限制数量:" + limit_num + " 已学习数量:" + learned_num,  # 填写限制数量和已学习数量
+                "接口": ac["Interface"],
+                "PE VLAN[服务提供商]": ac["PE_VLAN"],
+                "CE VLAN[用户侧]": ac["CE_VLAN"],
+                "剥离外层 VLAN": ac["StripSvlan"],
+                "HSID": ac["HSID"],
+                "Result": "normal"
+            }
+            service_data.append(row)
+        
+        # 添加VC数据
+        for vc in vc_details:
+            row = {
+                "网元类型": ne_type,
+                "网元名称": ne_name,
+                "网元IP": ne_ip,
+                "类型": "VC",
+                "VSI_ID": vsi_id,
+                "VSI名称": vsi_name,
+                "MTU": mtu,
+                "目的节点": vc["DestNode"],
+                "状态": vc["Status"],
+                "VC_ID": vc["VC_ID"],
+                "入标签": vc["InLabel"],
+                "出标签": vc["OutLabel"],
+                "隧道ID": vc["TunnelID"],
+                "接口": "-",
+                "PE VLAN[服务提供商]": "-",
+                "CE VLAN[用户侧]": "-",
+                "剥离外层 VLAN": "-",
+                "HSID": vc["HSID"],
+                "Result": vc["Result"]
+            }
+            
+            # 如果有AC数据，填充接口和VLAN信息
+            if ac_details:
+                # 默认使用第一个AC的信息
+                row["接口"] = ac_details[0]["Interface"]
+                row["PE VLAN[服务提供商]"] = ac_details[0]["PE_VLAN"]
+                row["CE VLAN[用户侧]"] = ac_details[0]["CE_VLAN"]
+                row["剥离外层 VLAN"] = ac_details[0]["StripSvlan"]
+            
+            service_data.append(row)
+    
     # 如果没有数据，返回默认行
     if not service_data:
         print("Debug: No service data parsed")
@@ -5590,8 +5630,6 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
             "VSI_ID": "-",
             "VSI名称": "-",
             "MTU": "-",
-            "描述": "-",
-            "组ID": "-",
             "目的节点": "-",
             "状态": "-",
             "VC_ID": "-",
@@ -5599,15 +5637,16 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
             "出标签": "-",
             "隧道ID": "-",
             "接口": "-",
-            "PE VLAN [提供商VLAN]": "-",
-            "CE VLAN [客户VLAN]": "-",
+            "PE VLAN[服务提供商]": "-",
+            "CE VLAN[用户侧]": "-",
             "剥离外层 VLAN": "-",
             "HSID": "-",
             "Result": "normal"
         }]
-
+    
     print(f"Debug: Parsed {len(service_data)} service entries")
     return service_data
+
 yellow_fill = PatternFill(start_color="FFFF00",
                           end_color="FFFF00", fill_type="solid")
 orange_fill = PatternFill(start_color="FFA500",
@@ -8037,7 +8076,6 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
             # 尝试备用方案
             execute_some_command(
                 channel, "screen-length 512", timeout=1, max_retries=3)
-
         for cmd in commands:
             print(f"[DEBUG] 执行命令 {cmd} 于设备 {ip}")
             logging.info(f"设备 {ip} - 执行命令: {cmd}")
@@ -10266,9 +10304,9 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
 
         elif item['name'] == "专网业务分析":
-            headers = ["网元类型", "网元名称", "网元IP", "类型", "VSI_ID", "VSI名称", "MTU", "描述", "组ID",
-                       "目的节点", "状态", "VC_ID", "入标签", "出标签", "隧道ID", "接口", "PE VLAN", "CE VLAN",
-                       "剥离外层 VLAN", "HSID", "Result", "备注"]
+            headers = ["网元类型", "网元名称", "网元IP", "类型", "VSI_ID", "VSI名称", "MTU",
+                       "目的节点", "状态", "VC_ID", "入标签", "出标签", "隧道ID", "接口", "PE VLAN[服务提供商]", "CE VLAN[用户侧]",
+                       "剥离外层 VLAN", "HSID", "Result"]
             ws.append(headers)
             for cell in ws[1]:
                 cell.fill = yellow_fill
@@ -10294,7 +10332,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if not services or services[0]["类型"] == "-":
                     total_results += 1
                     ws.append([ne_type, device_name, ip] + ["-"]
-                              * 17 + ["normal", "无专网业务数据"])
+                              * 15 + ["normal"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -10315,8 +10353,6 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         service["VSI_ID"],
                         service["VSI名称"],
                         service["MTU"],
-                        service["描述"],
-                        service["组ID"],
                         service["目的节点"],
                         service["状态"],
                         service["VC_ID"],
@@ -10324,8 +10360,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         service["出标签"],
                         service["隧道ID"],
                         service["接口"],
-                        service["PE VLAN"],
-                        service["CE VLAN"],
+                        service["PE VLAN[服务提供商]"],
+                        service["CE VLAN[用户侧]"],
                         service["剥离外层 VLAN"],
                         service["HSID"],
                         service["Result"]
@@ -10337,7 +10373,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         cell.border = thin_border
 
                     if service["Result"] != "normal":
-                        ws.cell(row=ws.max_row, column=21).fill = orange_fill
+                        # Result列填充橙色
+                        ws.cell(row=ws.max_row, column=19).fill = orange_fill
 
                 end_row = ws.max_row
                 if start_row < end_row:
@@ -10561,7 +10598,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "专网业务分析",
             "若专网业务状态为Down，检查VPLS配置、MPLS LDP会话或物理链路；若AC接口状态异常，验证接口VLAN配置。",
             "VPLS或VC状态为Down时，输出 'error'；AC状态正常，输出 'normal'；无数据输出 'error'。",
-            "show vsi brief;show mpls vpls detail "
+            "show vsi brief"
         ]
     ]
     for row_data in guide_content:
@@ -10691,6 +10728,33 @@ def sanitize_string(value):
         return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value)
     return value
 
+def _progress_bar(seconds: int, completion_msg: str):
+    """可视化进度条 (兼容Windows/Linux)"""
+    symbols = cycle(['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'])  # 旋转动画符号
+    end_time = time.time() + seconds
+    
+    while time.time() < end_time:
+        remaining = int(end_time - time.time())
+        # 进度百分比计算
+        progress = 100 - int((remaining / seconds) * 100)
+        # 动态颜色（红色->黄色->绿色渐变）
+        color_code = f"\033[38;5;{28 + min(progress * 2, 56)}m"  # 使用 ANSI 颜色代码
+        # 进度条生成
+        bar = f"{Fore.GREEN}▰" * int(progress / 5) + f"{Fore.LIGHTBLACK_EX}▱" * int((100 - progress) / 5)
+        # 动态输出
+        sys.stdout.write(
+            f"\r{next(symbols)} "
+            f"{color_code}▏{progress}%{Style.RESET_ALL} "
+            f"{bar} "
+            f"{Fore.CYAN}剩余时间: {remaining}s{Style.RESET_ALL}"
+        )
+        sys.stdout.flush()
+        time.sleep(0.1)
+    
+    # 清除当前行并输出完成消息
+    sys.stdout.write(f"\r{' ' * 80}\r")  # 清除整行
+    sys.stdout.flush()
+    print(f"{Fore.GREEN}✓ {completion_msg}{Style.RESET_ALL}")
 
 # ---------------------------------------------------
 # 主函数
@@ -11266,7 +11330,7 @@ if __name__ == '__main__':
                 },
                 "25": {
                     "name": "专网业务分析",
-                    "command": ["show mpls vpls detail", "show vsi brief"],
+                    "command": ["show vsi brief"],
                     "parser": parse_private_network_service,
                     "sheet_name": "专网业务分析",
                     "category": "冗余与容灾"
@@ -11325,6 +11389,7 @@ if __name__ == '__main__':
                     if not selected_items:
                         print(f"{Fore.RED}[ERROR] 未选择任何巡检项目{Style.RESET_ALL}")
                         continue
+                _progress_bar(10, "🚀 清洗就绪")
                 # 直接调用generate_qa_report进行数据清洗和报告生成
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
@@ -11393,10 +11458,10 @@ if __name__ == '__main__':
                     commands.extend(
                         ["show users", "show login-global-rule", "show loginning-user"])
                 if any(item['name'] == "专网业务分析" for item in selected_items):
-                    commands.extend(["show vsi brief,show mpls vpls detail"])
+                    commands.extend(["show vsi brief"])
                 commands.append("show device")
 
-                # Remove duplicates
+                # 去除重复项
                 commands = list(set(commands))
 
                 # Debugging output
@@ -11404,6 +11469,7 @@ if __name__ == '__main__':
                     f"{Fore.YELLOW}[DEBUG] 用户选择巡检项: {', '.join([item['name'] for item in selected_items])}{Style.RESET_ALL}")
                 print(
                     f"{Fore.YELLOW}[DEBUG] 采集的命令: {commands}{Style.RESET_ALL}")
+                _progress_bar(10, "🚀 设备会话就绪")
 
                 # Proceed with file inputs and report generation
                 raw_file = getinput("qa_raw.txt", "原始数据文件（默认：qa_raw.txt）：")
@@ -11411,6 +11477,7 @@ if __name__ == '__main__':
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
                 fish_multiple_cmds(host_file, raw_file, commands)
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
+                _progress_bar(10, "🚀 就绪")
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
 
