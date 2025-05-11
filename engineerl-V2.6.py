@@ -2,6 +2,10 @@
 STN-A设备巡检系统 v2.6
 使用前需手动安装模块：pip install openpyxl pytz paramiko tqdm colorama
 更新说明：
+
+新增功能
+    系统运行状态:
+        PTP时钟检查
 - 修复若干BUG
         
 作者：杨茂森
@@ -5427,19 +5431,499 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=20):
 
     print(f"{Fore.CYAN}[END] QA巡检数据采集完成{Style.RESET_ALL}")
 
+
+
+def parse_ptp_clock_status(ptp_output, synce_output, ne_type, ne_name, ne_ip):
+    """解析PTP时钟检查功能数据"""
+    print("Debug: Starting PTP clock status parsing")
+    result_data = []
+
+    # 如果没有输出，返回无条目状态
+    if not ptp_output or "Error" in ptp_output or len(ptp_output.strip()) < 10:
+        print("Debug: No PTP output or error in output")
+        return [{
+            "网元类型": ne_type,
+            "网元名称": ne_name,
+            "网元IP": ne_ip,
+            "时钟标识": "-",
+            "PTP状态": "-",
+            "时钟模式": "-",
+            "域值": "-",
+            "从模式": "-",
+            "步进模式": "-",
+            "BMC优先级1": "-",
+            "BMC优先级2": "-",
+            "BMC时钟等级": "-",
+            "BMC时钟精度": "-",
+            "当前时钟源(PTP)": "-",
+            "PTP实际状态": "-",
+            "GM时钟标识": "-",
+            "父时间标识": "-",
+            "父时钟跳数": "-",
+            "GM偏移统计(us)": "-",
+            "GM时钟源类型": "-",
+            "接收端口号": "-",
+            "端口WTR(s)": "-",
+            "时钟关系": "-",
+            "通告超时": "-",
+            "SyncE当前时钟源": "-",
+            "SSM控制": "-",
+            "SSM输入门限": "-",
+            "SSM-Rx": "-",
+            "RealRx": "-",
+            "SSM-Tx": "-",
+            "优先级": "-",
+            "保持时间(ms)": "-",
+            "不对称时间(ns)": "-",
+            "不对称方向": "-",
+            "延迟机制": "-",
+            "通告间隔(s)": "-",
+            "同步间隔(s)": "-",
+            "延迟请求间隔(s)": "-",
+            "外部SyncE类型": "-",
+            "输出控制": "-",
+            "SaBit": "-",
+            "输出门限": "-",
+            "Result": "normal"
+        }]
+
+    try:
+        # 解析PTP输出
+        clock_identity = ""
+        ptp_state = ""
+        clock_mode = ""
+        domain_value = ""
+        slave_mode = ""
+        step_mode = ""
+        bmc_priority1 = ""
+        bmc_priority2 = ""
+        bmc_clock_class = ""
+        bmc_clock_accuracy = ""
+        current_source = ""
+        real_state = ""
+        gm_clock_identity = ""
+        parent_clock_identity = ""
+        parent_steps_removed = ""
+        gm_offset_stats = ""
+        gm_time_source = ""
+        recv_port_number = ""
+        port_wtr = ""
+        clock_relation = ""
+        announce_timeout = ""
+        
+        # 解析延迟机制和间隔相关信息
+        delay_mechanism = ""
+        announce_interval = ""
+        sync_interval = ""
+        delay_req_interval = ""
+        asymmetry_direction = ""
+        asymmetry_time = ""
+
+        # 从PTP输出中提取信息
+        for line in ptp_output.splitlines():
+            line = line.strip()
+            
+            # 解析时钟标识
+            if "ClockIdentity" in line and not clock_identity:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    clock_identity = parts[1].strip()
+            
+            # 解析PTP状态
+            elif "PTPState" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    ptp_state = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含ClockMode
+                    if "ClockMode" in line:
+                        clock_mode = line.split("ClockMode")[1].split(":")[1].strip()
+            
+            # 解析时钟模式（如果还没有找到）
+            elif "ClockMode" in line and not clock_mode:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    clock_mode = parts[1].strip()
+            
+            # 解析域值
+            elif "DomainValue" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    domain_value = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含SlaveMode
+                    if "SlaveMode" in line:
+                        slave_mode = line.split("SlaveMode")[1].split(":")[1].strip()
+            
+            # 解析从模式（如果还没有找到）
+            elif "SlaveMode" in line and not slave_mode:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    slave_mode = parts[1].strip()
+            
+            # 解析步进模式
+            elif "StepMode" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    step_mode = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含PortWTR
+                    if "PortWTR" in line:
+                        port_wtr = line.split("PortWTR")[1].split(":")[1].strip()
+            
+            # 解析BMC优先级1
+            elif "BMCPriority1" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    bmc_priority1 = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含BMCPriority2
+                    if "BMCPriority2" in line:
+                        bmc_priority2 = line.split("BMCPriority2")[1].split(":")[1].strip()
+            
+            # 解析BMC优先级2（如果还没有找到）
+            elif "BMCPriority2" in line and not bmc_priority2:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    bmc_priority2 = parts[1].strip()
+            
+            # 解析BMC时钟等级
+            elif "BMCClockClass" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    bmc_clock_class = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含BMCClockAccuracy
+                    if "BMCClockAccuracy" in line:
+                        bmc_clock_accuracy = line.split("BMCClockAccuracy")[1].split(":")[1].strip()
+            
+            # 解析当前时钟源
+            elif "SelectSource" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    current_source = parts[1].strip()
+            
+            # 解析GM时钟标识
+            elif "GMClockIdentity" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    gm_clock_identity = parts[1].strip()
+            
+            # 解析GM偏移统计
+            elif "GMOffsetStats" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    gm_offset_stats = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含GMTimeSource
+                    if "GMTimeSource" in line:
+                        gm_time_source = line.split("GMTimeSource")[1].split(":")[1].strip()
+            
+            # 解析父时间标识
+            elif "ParentClockIdentity" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    parent_clock_identity = parts[1].strip()
+            
+            # 解析父时钟跳数
+            elif "ParentStepsRemoved" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    parent_steps_removed = parts[1].strip().split()[0]
+            
+            # 解析接收端口号
+            elif "RecvPortNumber" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    recv_port_number = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含ClockRelation
+                    if "ClockRelation" in line:
+                        clock_relation = line.split("ClockRelation")[1].split(":")[1].strip()
+
+            # 解析延迟机制
+            elif "DelayMechanism" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    delay_mechanism = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含AnnounceTimeout
+                    if "AnnounceTimeout" in line:
+                        announce_timeout = line.split("AnnounceTimeout")[1].split(":")[1].strip()
+            
+            # 解析通告间隔
+            elif "AnnounceInterval(s)" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    announce_interval = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含SyncInterval
+                    if "SyncInterval(s)" in line:
+                        sync_interval = line.split("SyncInterval(s)")[1].split(":")[1].strip()
+            
+            # 解析延迟请求间隔
+            elif "DelayReqInterval(s)" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    delay_req_interval = parts[1].strip().split()[0]
+            
+            # 解析不对称方向
+            elif "AsymmetryDirection" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    asymmetry_direction = parts[1].strip().split()[0]
+                    
+                    # 同一行可能包含AsymmetryMode
+                    if "AsymmetryMode" in line:
+                        # 不需要提取这个值，但需要处理掉这部分
+                        pass
+            
+            # 解析不对称时间
+            elif "AsymmetryTime(ns)" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    asymmetry_time = parts[1].strip().split()[0]
+            
+            # 解析PTP实际状态
+            elif "RealState" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    real_state = parts[1].strip()
+
+        # 解析SyncE输出
+        synce_source = "-"
+        ssm_control = "-"
+        input_threshold = "-"
+        ssm_rx = "-"
+        real_rx = "-"
+        ssm_tx = "-"
+        priority = "-"
+        holdoff_time = "-"
+        extern_synce_type = "-"
+        output_control = "-"
+        sa_bit = "-"
+        output_threshold = "-"
+        
+        if synce_output:
+            for line in synce_output.splitlines():
+                line = line.strip()
+                
+                # 解析当前时钟源
+                if "Current Clock Source" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        synce_source = parts[1].strip()
+                
+                # 解析SSM控制
+                elif "SSM-control" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        ssm_control = parts[1].strip()
+                
+                # 解析SSM输入门限
+                elif "input-threshold" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        input_threshold = parts[1].strip()
+                
+                # 解析外部SyncE类型
+                elif "extern synce type" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        extern_synce_type = parts[1].strip()
+                
+                # 解析输出控制
+                elif "output-control" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        output_control = parts[1].strip()
+                
+                # 解析SaBit
+                elif "sa-bit" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        sa_bit = parts[1].strip()
+                
+                # 解析输出门限
+                elif "output-threshold" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        output_threshold = parts[1].strip()
+                
+                # 尝试从synce source信息行获取更多详细信息
+                elif line.startswith(synce_source) and "SSM-Rx" in line:
+                    parts = line.split()
+                    if len(parts) >= 5:  # 至少应有5列
+                        ssm_rx = parts[1]
+                        real_rx = parts[2]
+                        ssm_tx = parts[3]
+                        priority = parts[4]
+                        if len(parts) > 5:
+                            holdoff_time = parts[5]
+        
+        # 判断PTP状态是否正常
+        # 基于提供的规则进行检查
+        result_status = "normal"
+        error_reasons = []
+        
+        # 检查基本状态
+        if ptp_state != "enable":
+            result_status = "error"
+            error_reasons.append("PTP未启用")
+        
+        if real_state != "SLAVE" and ptp_state == "enable":
+            result_status = "error"
+            error_reasons.append("PTP实际状态不是SLAVE")
+        
+        # 检查主时钟参数
+        if gm_clock_identity == "ffffffffffffffff":
+            result_status = "error"
+            error_reasons.append("GM时钟标识无效")
+        
+        if parent_steps_removed and int(parent_steps_removed) > 10:
+            result_status = "error"
+            error_reasons.append("父时钟跳数过高")
+        
+        if gm_offset_stats and int(gm_offset_stats) > 50:
+            result_status = "error"
+            error_reasons.append("GM偏移统计过高")
+        
+        # 检查BMC选举健康性
+        if bmc_priority1 == "255" and bmc_priority2 == "255":
+            result_status = "error"
+            error_reasons.append("BMC优先级配置异常")
+        
+        if bmc_clock_class and int(bmc_clock_class) > 128:
+            result_status = "error"
+            error_reasons.append("BMC时钟等级异常")
+        
+        # 检查SyncE与PTP路径是否一致
+        # 这需要更多信息来确定，此处简化判断
+        if synce_source == "-" and ptp_state == "enable":
+            result_status = "error"
+            error_reasons.append("SyncE时钟源缺失")
+        
+        if ssm_control != "on" and ptp_state == "enable":
+            result_status = "error"
+            error_reasons.append("SSM控制未开启")
+        
+        # 创建结果字典
+        row_data = {
+            "网元类型": ne_type,
+            "网元名称": ne_name,
+            "网元IP": ne_ip,
+            "时钟标识": clock_identity,
+            "PTP状态": ptp_state,
+            "时钟模式": clock_mode,
+            "域值": domain_value,
+            "从模式": slave_mode,
+            "步进模式": step_mode,
+            "BMC优先级1": bmc_priority1,
+            "BMC优先级2": bmc_priority2,
+            "BMC时钟等级": bmc_clock_class,
+            "BMC时钟精度": bmc_clock_accuracy,
+            "当前时钟源(PTP)": current_source,
+            "PTP实际状态": real_state,
+            "GM时钟标识": gm_clock_identity,
+            "父时间标识": parent_clock_identity,
+            "父时钟跳数": parent_steps_removed,
+            "GM偏移统计(us)": gm_offset_stats,
+            "GM时钟源类型": gm_time_source,
+            "接收端口号": recv_port_number,
+            "端口WTR(s)": port_wtr,
+            "时钟关系": clock_relation,
+            "通告超时": announce_timeout,
+            "SyncE当前时钟源": synce_source,
+            "SSM控制": ssm_control,
+            "SSM输入门限": input_threshold,
+            "SSM-Rx": ssm_rx,
+            "RealRx": real_rx,
+            "SSM-Tx": ssm_tx,
+            "优先级": priority,
+            "保持时间(ms)": holdoff_time,
+            "不对称时间(ns)": asymmetry_time,
+            "不对称方向": asymmetry_direction,
+            "延迟机制": delay_mechanism,
+            "通告间隔(s)": announce_interval,
+            "同步间隔(s)": sync_interval,
+            "延迟请求间隔(s)": delay_req_interval,
+            "外部SyncE类型": extern_synce_type,
+            "输出控制": output_control,
+            "SaBit": sa_bit,
+            "输出门限": output_threshold,
+            "Result": result_status
+        }
+        
+        result_data.append(row_data)
+        print(f"Debug: Completed PTP clock status parsing with status: {result_status}")
+        
+        if error_reasons:
+            print(f"Debug: Error reasons: {', '.join(error_reasons)}")
+        
+        return result_data
+        
+    except Exception as e:
+        print(f"Debug: Error parsing PTP status: {str(e)}")
+        # 发生错误时返回默认数据
+        return [{
+            "网元类型": ne_type,
+            "网元名称": ne_name,
+            "网元IP": ne_ip,
+            "时钟标识": "-",
+            "PTP状态": "-",
+            "时钟模式": "-",
+            "域值": "-",
+            "从模式": "-",
+            "步进模式": "-",
+            "BMC优先级1": "-",
+            "BMC优先级2": "-",
+            "BMC时钟等级": "-",
+            "BMC时钟精度": "-",
+            "当前时钟源(PTP)": "-",
+            "PTP实际状态": "-",
+            "GM时钟标识": "-",
+            "父时间标识": "-",
+            "父时钟跳数": "-",
+            "GM偏移统计(us)": "-",
+            "GM时钟源类型": "-",
+            "接收端口号": "-",
+            "端口WTR(s)": "-",
+            "时钟关系": "-",
+            "通告超时": "-",
+            "SyncE当前时钟源": "-",
+            "SSM控制": "-",
+            "SSM输入门限": "-",
+            "SSM-Rx": "-",
+            "RealRx": "-",
+            "SSM-Tx": "-",
+            "优先级": "-",
+            "保持时间(ms)": "-",
+            "不对称时间(ns)": "-",
+            "不对称方向": "-",
+            "延迟机制": "-",
+            "通告间隔(s)": "-",
+            "同步间隔(s)": "-",
+            "延迟请求间隔(s)": "-",
+            "外部SyncE类型": "-",
+            "输出控制": "-",
+            "SaBit": "-",
+            "输出门限": "-",
+            "Result": "error"
+        }]
+
 def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_ip):
     """解析专网业务分析数据"""
     print("Debug: Starting private network service parsing")
     service_data = []
 
     lines = vsi_output.splitlines()
-    
+
     # 找到所有VSI块的起始位置
     vsi_block_starts = []
     for i, line in enumerate(lines):
         if "VSI:" in line and "Name:" in line and "MTU:" in line:
             vsi_block_starts.append(i)
-    
+
     # 如果没有找到VSI块，返回默认行
     if not vsi_block_starts:
         print("Debug: No VSI blocks found")
@@ -5464,13 +5948,14 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
             "HSID": "-",
             "Result": "normal"
         }]
-    
+
     # 处理每个VSI块
     for block_idx, start_idx in enumerate(vsi_block_starts):
         # 确定块的结束位置
-        end_idx = vsi_block_starts[block_idx + 1] if block_idx + 1 < len(vsi_block_starts) else len(lines)
+        end_idx = vsi_block_starts[block_idx + 1] if block_idx + \
+            1 < len(vsi_block_starts) else len(lines)
         block_lines = lines[start_idx:end_idx]
-        
+
         # 解析VSI基本信息
         vsi_id = "-"
         vsi_name = "-"
@@ -5481,7 +5966,7 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
         limit_act = "-"
         limit_num = "-"
         learned_num = "-"
-        
+
         for line in block_lines:
             # 解析VSI基本信息行
             vsi_match = re.search(
@@ -5495,7 +5980,7 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                 print(
                     f"Debug: Parsed VSI - ID: {vsi_id}, Name: {vsi_name}, MTU: {mtu}, PwSignal: {pw_signal}, Type: {vsi_type}")
                 continue
-            
+
             # 解析MAC学习相关信息
             mac_learn_match = re.search(
                 r'mac-learn:\s+(\S+)\s+limit-Act:(\S+)\s+limit-num:(\d+)\s+learned-num:(\d+)', line)
@@ -5507,15 +5992,18 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                 print(
                     f"Debug: Parsed MAC Learning - Status: {mac_learn}, Limit-Act: {limit_act}, Limit-Num: {limit_num}, Learned-Num: {learned_num}")
                 continue
-        
+
         # 找到当前VSI块中的VC和AC部分
-        line_vc = next((i for i, line in enumerate(block_lines) if "--VC--" in line), None)
-        line_ac = next((i for i, line in enumerate(block_lines) if "--AC--" in line and i > line_vc), None) if line_vc is not None else None
-        
+        line_vc = next((i for i, line in enumerate(
+            block_lines) if "--VC--" in line), None)
+        line_ac = next((i for i, line in enumerate(
+            block_lines) if "--AC--" in line and i > line_vc), None) if line_vc is not None else None
+
         # 获取VC和AC数据行（跳过表头）
-        vc_lines = block_lines[line_vc + 2:line_ac] if line_vc is not None and line_ac is not None else []
+        vc_lines = block_lines[line_vc +
+                               2:line_ac] if line_vc is not None and line_ac is not None else []
         ac_lines = block_lines[line_ac + 2:] if line_ac is not None else []
-        
+
         # 解析VC信息
         vc_details = []
         for vc_line in vc_lines:
@@ -5525,10 +6013,10 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                 status = vc_match.group(3).lower()
                 dest_node = vc_match.group(2)
                 result = "normal" if status == "up" or dest_node == "1.1.1.1" else "error"
-                
+
                 # 不转换状态为中文，使用原始状态
                 status_orig = vc_match.group(3)
-                
+
                 vc_details.append({
                     "VC_ID": vc_match.group(1),
                     "DestNode": dest_node,
@@ -5542,8 +6030,9 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                     "HSID": vc_match.group(10),
                     "Result": result
                 })
-                print(f"Debug: VC - VSI: {vsi_id}, VC_ID: {vc_match.group(1)}, DestNode: {dest_node}, Status: {status_orig}")
-        
+                print(
+                    f"Debug: VC - VSI: {vsi_id}, VC_ID: {vc_match.group(1)}, DestNode: {dest_node}, Status: {status_orig}")
+
         # 解析AC信息
         ac_details = []
         for ac_line in ac_lines:
@@ -5558,8 +6047,9 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                     "StripSvlan": ac_match.group(5).lower(),
                     "HSID": ac_match.group(6)
                 })
-                print(f"Debug: AC - VSI: {vsi_id}, Interface: {ac_match.group(2)}, PE_VLAN: {ac_match.group(3)}")
-        
+                print(
+                    f"Debug: AC - VSI: {vsi_id}, Interface: {ac_match.group(2)}, PE_VLAN: {ac_match.group(3)}")
+
         # 添加AC数据
         for ac in ac_details:
             row = {
@@ -5584,7 +6074,7 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                 "Result": "normal"
             }
             service_data.append(row)
-        
+
         # 添加VC数据
         for vc in vc_details:
             row = {
@@ -5608,7 +6098,7 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                 "HSID": vc["HSID"],
                 "Result": vc["Result"]
             }
-            
+
             # 如果有AC数据，填充接口和VLAN信息
             if ac_details:
                 # 默认使用第一个AC的信息
@@ -5616,9 +6106,9 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
                 row["PE VLAN[服务提供商]"] = ac_details[0]["PE_VLAN"]
                 row["CE VLAN[用户侧]"] = ac_details[0]["CE_VLAN"]
                 row["剥离外层 VLAN"] = ac_details[0]["StripSvlan"]
-            
+
             service_data.append(row)
-    
+
     # 如果没有数据，返回默认行
     if not service_data:
         print("Debug: No service data parsed")
@@ -5643,9 +6133,10 @@ def parse_private_network_service(vpls_output, vsi_output, ne_type, ne_name, ne_
             "HSID": "-",
             "Result": "normal"
         }]
-    
+
     print(f"Debug: Parsed {len(service_data)} service entries")
     return service_data
+
 
 yellow_fill = PatternFill(start_color="FFFF00",
                           end_color="FFFF00", fill_type="solid")
@@ -8590,7 +9081,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     # Read host file
     with open(host_file, "r", encoding='gbk', errors='ignore') as f:
         reader = csv.reader(f)
-        next(reader)
+        # next(reader)
         host_ips = [row[0].strip() for row in reader]
         print(
             f"{Fore.GREEN}[DEBUG] Loaded {len(host_ips)} devices{Style.RESET_ALL}")
@@ -10387,6 +10878,73 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
 
+        elif item['name'] == "PTP时钟检查":
+            headers = ["网元类型", "网元名称", "网元IP", "时钟标识", "PTP状态", "时钟模式", "域值", 
+                       "从模式", "步进模式", "BMC优先级1", "BMC优先级2", "BMC时钟等级", "BMC时钟精度", 
+                       "当前时钟源(PTP)", "PTP实际状态", "GM时钟标识", "父时间标识", "父时钟跳数", 
+                       "GM偏移统计(us)", "GM时钟源类型", "接收端口号", "端口WTR(s)", "时钟关系", 
+                       "通告超时", "SyncE当前时钟源", "SSM控制", "SSM输入门限", "SSM-Rx", "RealRx", 
+                       "SSM-Tx", "优先级", "保持时间(ms)", "不对称时间(ns)", "不对称方向", "延迟机制", 
+                       "通告间隔(s)", "同步间隔(s)", "延迟请求间隔(s)", "外部SyncE类型", "输出控制", 
+                       "SaBit", "输出门限", "Result"]
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.fill = yellow_fill
+                cell.alignment = center_alignment
+                cell.border = thin_border
+
+            total_results = 0
+            normal_results = 0
+            for ip in sorted(host_ips):
+                if ip in connection_failures:
+                    continue
+                
+                ne_type, device_name = "-", "-"
+                if ip in data and "show device" in data[ip]:
+                    ne_type, device_name, _, _ = parse_uptime(data[ip]["show device"])
+
+                ptp_output = data[ip]["show ptp all"] if ip in data and "show ptp all" in data[ip] else ""
+                synce_output = data[ip]["show synce"] if ip in data and "show synce" in data[ip] else ""
+
+                # 解析PTP时钟状态数据
+                ptp_data = parse_ptp_clock_status(ptp_output, synce_output, ne_type, device_name, ip)
+
+                for entry in ptp_data:
+                    total_results += 1
+                    if entry["Result"] == "normal":
+                        normal_results += 1
+
+                    row_data = [
+                        entry["网元类型"], entry["网元名称"], entry["网元IP"], entry["时钟标识"], 
+                        entry["PTP状态"], entry["时钟模式"], entry["域值"], entry["从模式"], 
+                        entry["步进模式"], entry["BMC优先级1"], entry["BMC优先级2"], entry["BMC时钟等级"], 
+                        entry["BMC时钟精度"], entry["当前时钟源(PTP)"], entry["PTP实际状态"], 
+                        entry["GM时钟标识"], entry["父时间标识"], entry["父时钟跳数"], 
+                        entry["GM偏移统计(us)"], entry["GM时钟源类型"], entry["接收端口号"], 
+                        entry["端口WTR(s)"], entry["时钟关系"], entry["通告超时"], 
+                        entry["SyncE当前时钟源"], entry["SSM控制"], entry["SSM输入门限"], 
+                        entry["SSM-Rx"], entry["RealRx"], entry["SSM-Tx"], entry["优先级"], 
+                        entry["保持时间(ms)"], entry["不对称时间(ns)"], entry["不对称方向"], 
+                        entry["延迟机制"], entry["通告间隔(s)"], entry["同步间隔(s)"], 
+                        entry["延迟请求间隔(s)"], entry["外部SyncE类型"], entry["输出控制"], 
+                        entry["SaBit"], entry["输出门限"], entry["Result"]
+                    ]
+                    ws.append(row_data)
+
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+
+                    if entry["Result"] != "normal":
+                        # Result列填充橙色
+                        ws.cell(row=ws.max_row, column=43).fill = orange_fill
+
+            # 计算健康度
+            health_percentage = (normal_results / total_results * 100) if total_results > 0 else 0
+            health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
+        
+
     # Create login failure sub-sheet
     ws_failure = wb.create_sheet(title="登录失败设备")
     headers = ["网元IP", "故障原因"]
@@ -10599,7 +11157,14 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "若专网业务状态为Down，检查VPLS配置、MPLS LDP会话或物理链路；若AC接口状态异常，验证接口VLAN配置。",
             "VPLS或VC状态为Down时，输出 'error'；AC状态正常，输出 'normal'；无数据输出 'error'。",
             "show vsi brief"
-        ]
+        ],
+        [
+            "26",
+            "PTP时钟检查",
+            "当发现PTP状态异常时，检查设备时钟信号源、线路连接和BMC优先级配置；若GM偏移统计过大，检查网络延迟和时钟配置同步；确保SyncE与PTP路径一致。",
+            "PTP状态须为enable，实际状态为SLAVE；GM时钟标识不为全F；父时钟跳数≤10；GM偏移统计≤50μs；BMC优先级1/2不全为255；BMC时钟等级≤128；SSM控制为on。",
+            "show ptp all, show synce"
+]
     ]
     for row_data in guide_content:
         ws_guide.append(row_data)
@@ -10728,11 +11293,12 @@ def sanitize_string(value):
         return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value)
     return value
 
+
 def _progress_bar(seconds: int, completion_msg: str):
     """可视化进度条 (兼容Windows/Linux)"""
     symbols = cycle(['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'])  # 旋转动画符号
     end_time = time.time() + seconds
-    
+
     while time.time() < end_time:
         remaining = int(end_time - time.time())
         # 进度百分比计算
@@ -10740,7 +11306,8 @@ def _progress_bar(seconds: int, completion_msg: str):
         # 动态颜色（红色->黄色->绿色渐变）
         color_code = f"\033[38;5;{28 + min(progress * 2, 56)}m"  # 使用 ANSI 颜色代码
         # 进度条生成
-        bar = f"{Fore.GREEN}▰" * int(progress / 5) + f"{Fore.LIGHTBLACK_EX}▱" * int((100 - progress) / 5)
+        bar = f"{Fore.GREEN}▰" * int(progress / 5) + \
+            f"{Fore.LIGHTBLACK_EX}▱" * int((100 - progress) / 5)
         # 动态输出
         sys.stdout.write(
             f"\r{next(symbols)} "
@@ -10750,11 +11317,12 @@ def _progress_bar(seconds: int, completion_msg: str):
         )
         sys.stdout.flush()
         time.sleep(0.1)
-    
+
     # 清除当前行并输出完成消息
     sys.stdout.write(f"\r{' ' * 80}\r")  # 清除整行
     sys.stdout.flush()
     print(f"{Fore.GREEN}✓ {completion_msg}{Style.RESET_ALL}")
+
 
 # ---------------------------------------------------
 # 主函数
@@ -11334,7 +11902,15 @@ if __name__ == '__main__':
                     "parser": parse_private_network_service,
                     "sheet_name": "专网业务分析",
                     "category": "冗余与容灾"
-                }
+                },
+                "26": {
+                    "name": "PTP时钟检查",
+                    "command": ["show ptp all", "show synce"],
+                    "parser": lambda ptp_output, synce_output, ne_type, ne_name, ne_ip: parse_ptp_clock_status(ptp_output, synce_output, ne_type, ne_name, ne_ip),
+                    "sheet_name": "PTP时钟检查",
+                    "category": "系统运行状态"
+},
+
             }
 
             # Group items by category for display
@@ -11389,7 +11965,6 @@ if __name__ == '__main__':
                     if not selected_items:
                         print(f"{Fore.RED}[ERROR] 未选择任何巡检项目{Style.RESET_ALL}")
                         continue
-                _progress_bar(10, "🚀 清洗就绪")
                 # 直接调用generate_qa_report进行数据清洗和报告生成
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
@@ -11459,6 +12034,9 @@ if __name__ == '__main__':
                         ["show users", "show login-global-rule", "show loginning-user"])
                 if any(item['name'] == "专网业务分析" for item in selected_items):
                     commands.extend(["show vsi brief"])
+                if any(item['name'] == "PTP时钟检查" for item in selected_items):
+                    commands.extend(["show ptp all", "show synce"])
+                    
                 commands.append("show device")
 
                 # 去除重复项
@@ -11469,15 +12047,14 @@ if __name__ == '__main__':
                     f"{Fore.YELLOW}[DEBUG] 用户选择巡检项: {', '.join([item['name'] for item in selected_items])}{Style.RESET_ALL}")
                 print(
                     f"{Fore.YELLOW}[DEBUG] 采集的命令: {commands}{Style.RESET_ALL}")
-                _progress_bar(10, "🚀 设备会话就绪")
 
                 # Proceed with file inputs and report generation
                 raw_file = getinput("qa_raw.txt", "原始数据文件（默认：qa_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
                 fish_multiple_cmds(host_file, raw_file, commands)
+                _progress_bar(10, "🚀 设备会话就绪")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
-                _progress_bar(10, "🚀 就绪")
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
 
