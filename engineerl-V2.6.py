@@ -1,6 +1,6 @@
 """
 STN-A设备巡检系统 v2.6
-使用前需手动安装模块：pip install openpyxl pytz paramiko tqdm colorama
+使用前需手动安装模块：pip install openpyxl pytz paramiko tqdm colorama pyinstaller
 更新说明：
 
 新增功能
@@ -10,7 +10,7 @@ STN-A设备巡检系统 v2.6
         
 作者：杨茂森
 
-最后更新：2025-5-12
+最后更新：2025-5-16
 """
 # 导入必要的库
 from openpyxl.styles import PatternFill, Alignment, Border, Side
@@ -244,21 +244,28 @@ def client_close(client):
             pass
 
 
-def execute_some_command(channel, command, timeout=5, max_retries=3):
+def execute_some_command(channel, command, timeout=5, max_retries=3, command_delay=1, device_name="", ip=""):
     """
     执行命令并返回输出结果，处理分页提示，并在检测到特定错误时重试
+    同时检测输出中是否含有"Start Switching"，若有则终止程序
 
     Args:
         channel: SSH通道
         command: 要执行的命令
         timeout: 总超时时间(秒)
         max_retries: 最大重试次数
+        command_delay: 发送命令前等待的时间(秒)
+        device_name: 设备名称，用于主备切换错误报告
+        ip: 设备IP地址，用于主备切换错误报告
 
     Returns:
         命令执行的输出结果
     """
     if not channel:
         return ""
+
+    # 在发送命令前添加延迟，确保设备已准备好接收新命令
+    time.sleep(command_delay)  # 添加命令前延迟
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -267,13 +274,13 @@ def execute_some_command(channel, command, timeout=5, max_retries=3):
                 data = channel.recv(4096).decode('utf-8', 'ignore')
                 if '----MORE----' in data:
                     channel.send(' ')
-                    time.sleep(0.1)
+                    time.sleep(0.5)  # 增加分页处理延迟
 
             # 发送命令
             channel.send(command + '\n')
 
-            # 等待命令开始执行
-            time.sleep(0.5)
+            # 等待命令开始执行 - 增加延迟
+            time.sleep(1.5)  # 从0.5增加到1.5秒
 
             output = ""
             start_time = time.time()
@@ -286,14 +293,27 @@ def execute_some_command(channel, command, timeout=5, max_retries=3):
                 data = channel.recv(65535).decode('utf-8', 'ignore')
                 output += data
 
+                # 检查输出是否包含主备切换指示
+                if "Start Switching" in output:
+                    # 输出三次错误信息
+                    error_msg = f"⚠️⚠️⚠️ 检测到设备 {device_name}({ip}) 发生主备切换! 终止操作! ⚠️⚠️⚠️"
+                    for i in range(3):
+                        print(f"{Fore.RED}{error_msg}{Style.RESET_ALL}")
+                        logging.critical(error_msg)
+                    
+                    # 终止程序
+                    sys.exit(1)
+
                 # 检查最后一行的内容
                 lines = output.split('\n')
                 if lines:
                     last_line = lines[-1].strip()
                     if last_line == '----MORE----':
                         channel.send(' ')
-                        time.sleep(0.1)
+                        time.sleep(0.5)  # 增加分页处理延迟
                     elif last_line.endswith('>') or last_line.endswith('#') or last_line.endswith('$'):
+                        # 增加命令执行完成后的延迟，确保设备已完全处理
+                        time.sleep(0.5)  # 添加命令完成后延迟
                         break
 
             # 检查输出中是否包含错误信息
@@ -301,7 +321,7 @@ def execute_some_command(channel, command, timeout=5, max_retries=3):
                 return output  # 成功执行
             elif attempt < max_retries:
                 logging.warning(f"检测到错误，尝试重试 {attempt}/{max_retries}")
-                time.sleep(1)  # 在重试前等待1秒
+                time.sleep(2)  # 在重试前等待时间从1秒增加到2秒
             else:
                 logging.error(f"命令 {command} 达到最大重试次数")
                 return output  # 返回最后一次的输出
@@ -318,14 +338,22 @@ def execute_some_command(channel, command, timeout=5, max_retries=3):
     return output
 
 
-def config_host(channel, filename, revfile, ipaddr=''):
+def config_host(channel, filename, revfile, ipaddr='', device_name='', cmd_delay=1):
     # 禁用分页
-    execute_some_command(channel, 'screen-length 0', wait_time=2)
+    execute_some_command(channel, 'screen-length 0',
+                         timeout=2, command_delay=1, device_name=device_name, ip=ipaddr)
     try:
         with open(filename, "r", encoding='gbk', errors='ignore') as csvFile:
-            for cmd in csv.reader(csvFile):
+            for i, cmd in enumerate(csv.reader(csvFile)):
+                # 为每条命令之间添加延迟
+                if i > 0:
+                    print(f"[INFO] 等待 {cmd_delay} 秒后执行下一命令...")
+                    time.sleep(cmd_delay)
+
                 result = execute_some_command(
-                    channel, cmd[0]+'\n', wait_time=5)
+                    channel, cmd[0]+'\n', timeout=5, command_delay=1.5, 
+                    device_name=device_name, ip=ipaddr)
+                
                 for line in splitstr(result):
                     try:
                         revfile.write(f"{ipaddr} , {cmd[0]} , {line}\n")
@@ -337,8 +365,13 @@ def config_host(channel, filename, revfile, ipaddr=''):
                         print(f"执行命令 {cmd} 时出错: {e}")
                         continue
     finally:
+        # 执行完命令后等待一段时间再恢复分页设置
+        time.sleep(2)
         # 恢复分页设置
-        execute_some_command(channel, 'screen-length 25', wait_time=2)
+        execute_some_command(channel, 'screen-length 25',
+                         timeout=2, command_delay=1, device_name=device_name, ip=ipaddr)
+
+
 
 # 执行一跳CLI指令并保存结果
 
@@ -1243,12 +1276,10 @@ def process_device1(ip, user, pwd, cmd, index, total_devices, revFile, total_att
 
         # 连接设备
         channel = create_channel(
-            ipaddress=ip,
-            name=user,
-            psw=pwd,
-            retries=3,
-            current_device_index=index,
-            total_attempts=total_attempts
+            ip=ip,
+            username=user,     # Changed from user to username
+            password=pwd,      # Changed from pwd to password
+            retry_count=3 
         )
 
         # 处理连接结果
@@ -4170,7 +4201,6 @@ def fish_ospf_interface_info_cmd(filename, ret_name, max_workers=20):
 
 def process_ospf_device(ip, user, pwd, writer, fail_log):
     """处理单个设备的OSPF互联接口信息采集"""
-    import re
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from tqdm import tqdm
     from colorama import Fore, Style
@@ -4201,41 +4231,28 @@ def process_ospf_device(ip, user, pwd, writer, fail_log):
 
         interfaces = parse_ospf_interfaces(clean_ospf, process_id=31)
         print(f"[DEBUG] 设备 {ip} 解析到的接口: {interfaces}")
+        for intf in interfaces:
+            physical_intf = intf.split('.')[0]
+            print(f"[DEBUG] 设备 {ip} 使用物理接口: {physical_intf}")
+            cmd_intf = f"show interface {physical_intf}"
+            intf_output = execute_some_command(channel, cmd_intf, 3)
+            clean_intf = "\n".join([
+                line.strip()
+                for line in intf_output.split('\n')
+                if line.strip() and line.strip() != cmd_intf
+            ])
+            with file_lock:  # 线程安全写入
+                writer.writerow([ip, cmd_intf, clean_intf])
 
-        # 获取所有接口信息
-        all_intf_output = execute_some_command(channel, "show interface", 10)
-        clean_all_intf = "\n".join([
-            line.strip()
-            for line in all_intf_output.split('\n')
-            if line.strip() and line.strip() != "show interface"
-        ])
-
-        # 解析所有接口信息，跳过 Loopback 接口
-        intf_blocks = re.split(
-            r'\n(?=\S+ is \S+, line protocol is \S+)', clean_all_intf)
-        for block in intf_blocks:
-            intf_match = re.match(r'(\S+) is \S+, line protocol is \S+', block)
-            if intf_match:
-                intf_name = intf_match.group(1).strip()
-                if intf_name.lower().startswith('loopback'):
-                    continue  # 跳过 Loopback 接口
-                # 检查是否为 OSPF 相关接口
-                if intf_name in interfaces or any(intf_name in ospf_intf for ospf_intf in interfaces):
-                    # 写入接口信息
-                    with file_lock:  # 线程安全写入
-                        writer.writerow(
-                            [ip, f"show interface {intf_name}", block])
-
-                    # 获取 LLDP 信息
-                    cmd_lldp = f"show lldp neighbor interface {intf_name}"
-                    lldp_output = execute_some_command(channel, cmd_lldp, 3)
-                    clean_lldp = "\n".join([
-                        line.strip()
-                        for line in lldp_output.split('\n')
-                        if line.strip() and line.strip() != cmd_lldp
-                    ])
-                    with file_lock:  # 线程安全写入
-                        writer.writerow([ip, cmd_lldp, clean_lldp])
+            cmd_lldp = f"show lldp neighbor interface {physical_intf}"
+            lldp_output = execute_some_command(channel, cmd_lldp, 3)
+            clean_lldp = "\n".join([
+                line.strip()
+                for line in lldp_output.split('\n')
+                if line.strip() and line.strip() != cmd_lldp
+            ])
+            with file_lock:  # 线程安全写入
+                writer.writerow([ip, cmd_lldp, clean_lldp])
 
         execute_some_command(channel, "screen-length 25", 1)
 
@@ -5592,7 +5609,7 @@ def parse_ptp_clock_status(ptp_output, synce_output, ne_type, device_name, ip):
         port_match = re.search(
             r"Receive number\s*:\s*(.+?)\s+PTPNo\s*:\s*(\d+)", first_line)
         if port_match:
-            port_data["接收端口号"] = port_match.group(1).strip()
+            port_data["时钟端口"] = port_match.group(1).strip()
             port_data["PTPNo"] = port_match.group(2).strip()
 
         # Process remaining port attributes
@@ -5647,7 +5664,7 @@ def parse_ptp_clock_status(ptp_output, synce_output, ne_type, device_name, ip):
 
         # Step 3: Add default values for missing fields
         expected_fields = [
-            "接收端口号", "端口WTR(s)", "时钟关系", "通告超时", "不对称方向",
+            "时钟端口", "端口WTR(s)", "时钟关系", "通告超时", "不对称方向",
             "延迟机制", "通告间隔(s)", "同步间隔(s)", "延迟请求间隔(s)", "PTP实际状态"
         ]
 
@@ -5734,7 +5751,7 @@ def parse_ptp_clock_status(ptp_output, synce_output, ne_type, device_name, ip):
     # If no ports were found, create a default entry
     if not result["接收端口"]:
         result["接收端口"].append({
-            "接收端口号": "-",
+            "时钟端口": "-",
             "端口WTR(s)": "-",
             "时钟关系": "-",
             "通告超时": "-",
@@ -7896,14 +7913,19 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 "distance": "-",
                 "rx_power": "-",
                 "rx_range": "-",
+                "rx_alarm_range": "-",
                 "tx_power": "-",
                 "tx_range": "-",
+                "tx_alarm_range": "-",
                 "bias": "-",
                 "bias_range": "-",
+                "bias_alarm_range": "-",
                 "voltage": "-",
                 "voltage_range": "-",
+                "voltage_alarm_range": "-",
                 "temperature": "-",
                 "temp_range": "-",
+                "temp_alarm_range": "-",
                 "port_bw": "-",
                 "transceiver_bw": "-",
                 "input_rate": "-",
@@ -7965,36 +7987,81 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 interface_data[current_interface]["rx_power"] = parts[0].split(":", 1)[
                     1].strip()
                 if "Warning range:" in parts[1]:
-                    interface_data[current_interface]["rx_range"] = parts[1].split(":", 1)[
-                        1].strip()
+                    warning_range = parts[1].split(":", 1)[1].strip()
+                    # Extract alarm range if present
+                    if "Alarm range:" in warning_range:
+                        warning_part, alarm_part = warning_range.split(
+                            "Alarm range:")
+                        interface_data[current_interface]["rx_range"] = warning_part.strip(
+                        )
+                        interface_data[current_interface]["rx_alarm_range"] = alarm_part.strip(
+                        )
+                    else:
+                        interface_data[current_interface]["rx_range"] = warning_range
             elif "Tx Power:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["tx_power"] = parts[0].split(":", 1)[
                     1].strip()
                 if "Warning range:" in parts[1]:
-                    interface_data[current_interface]["tx_range"] = parts[1].split(":", 1)[
-                        1].strip()
+                    warning_range = parts[1].split(":", 1)[1].strip()
+                    # Extract alarm range if present
+                    if "Alarm range:" in warning_range:
+                        warning_part, alarm_part = warning_range.split(
+                            "Alarm range:")
+                        interface_data[current_interface]["tx_range"] = warning_part.strip(
+                        )
+                        interface_data[current_interface]["tx_alarm_range"] = alarm_part.strip(
+                        )
+                    else:
+                        interface_data[current_interface]["tx_range"] = warning_range
             elif "Bias:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["bias"] = parts[0].split(":", 1)[
                     1].strip()
                 if "Warning range:" in parts[1]:
-                    interface_data[current_interface]["bias_range"] = parts[1].split(":", 1)[
-                        1].strip()
+                    warning_range = parts[1].split(":", 1)[1].strip()
+                    # Extract alarm range if present
+                    if "Alarm range:" in warning_range:
+                        warning_part, alarm_part = warning_range.split(
+                            "Alarm range:")
+                        interface_data[current_interface]["bias_range"] = warning_part.strip(
+                        )
+                        interface_data[current_interface]["bias_alarm_range"] = alarm_part.strip(
+                        )
+                    else:
+                        interface_data[current_interface]["bias_range"] = warning_range
             elif "Voltage:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["voltage"] = parts[0].split(":", 1)[
                     1].strip()
                 if "Warning range:" in parts[1]:
-                    interface_data[current_interface]["voltage_range"] = parts[1].split(":", 1)[
-                        1].strip()
+                    warning_range = parts[1].split(":", 1)[1].strip()
+                    # Extract alarm range if present
+                    if "Alarm range:" in warning_range:
+                        warning_part, alarm_part = warning_range.split(
+                            "Alarm range:")
+                        interface_data[current_interface]["voltage_range"] = warning_part.strip(
+                        )
+                        interface_data[current_interface]["voltage_alarm_range"] = alarm_part.strip(
+                        )
+                    else:
+                        interface_data[current_interface]["voltage_range"] = warning_range
             elif "temperature:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["temperature"] = parts[0].split(":", 1)[
                     1].strip()
                 if "Warning range:" in parts[1]:
-                    interface_data[current_interface]["temp_range"] = parts[1].split(":", 1)[
-                        1].strip()
+                    warning_range = parts[1].split(":", 1)[1].strip()
+                    # Extract alarm range if present
+                    if "Alarm range:" in warning_range:
+                        warning_part, alarm_part = warning_range.split(
+                            "Alarm range:")
+                        interface_data[current_interface]["temp_range"] = warning_part.strip(
+                        )
+                        interface_data[current_interface]["temp_alarm_range"] = alarm_part.strip(
+                        )
+                    else:
+                        interface_data[current_interface]["temp_range"] = warning_range
             elif "Port BW:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["port_bw"] = parts[0].split(":", 1)[
@@ -8025,63 +8092,136 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                     print(
                         f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {current_interface} CRC解析失败: {crc_value}{Style.RESET_ALL}")
 
-    # Combine interface and LLDP data
+    # Helper function to convert range notation to min~max format
+    def convert_range_format(range_str):
+        if not range_str or range_str == "-":
+            return "-"
+
+        # Extract values from range notation like [3mA, 110mA]
+        match = re.search(
+            r'\[([-+]?\d+\.?\d*).*?,\s*([-+]?\d+\.?\d*).*?\]', range_str)
+        if match:
+            min_val, max_val = match.groups()
+            return f"{min_val}~{max_val}"
+        return range_str
+
+    # Process each interface to generate results
     for interface, data in interface_data.items():
         # Skip non-optical interfaces (e.g., loopback)
         if data["transceiver_id"] == "-":
             continue
+
+        # Convert all range formats to min~max
+        rx_range = convert_range_format(data["rx_range"])
+        rx_alarm_range = convert_range_format(data["rx_alarm_range"])
+        tx_range = convert_range_format(data["tx_range"])
+        tx_alarm_range = convert_range_format(data["tx_alarm_range"])
+        bias_range = convert_range_format(data["bias_range"])
+        bias_alarm_range = convert_range_format(data["bias_alarm_range"])
+        voltage_range = convert_range_format(data["voltage_range"])
+        voltage_alarm_range = convert_range_format(data["voltage_alarm_range"])
+        temp_range = convert_range_format(data["temp_range"])
+        temp_alarm_range = convert_range_format(data["temp_alarm_range"])
+
+        # Extract range values for comparison
+        def extract_range_values(range_str):
+            if range_str == "-" or "~" not in range_str:
+                return None, None
+            try:
+                min_val, max_val = range_str.split("~")
+                return float(min_val), float(max_val)
+            except (ValueError, TypeError):
+                return None, None
+
         result = "normal"
+        error_reasons = []
+
         # Check CRC
         if data["crc"] > 2048:
             result = "error"
+            error_reasons.append(f"CRC超过2048: {data['crc']}")
             print(
                 f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} CRC超过2048: {data['crc']}{Style.RESET_ALL}")
+
         # Check Rx Power
         try:
             rx_power = float(data["rx_power"].replace("dBm", ""))
+            rx_min, rx_max = extract_range_values(
+                rx_alarm_range if rx_alarm_range != "-" else rx_range)
+
             if rx_power == -40:
                 print(
                     f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Rx光功率为-40dBm (收无光)，状态为normal{Style.RESET_ALL}")
-            elif rx_power < -24 or rx_power > 4:
+            elif rx_min is not None and rx_max is not None and (rx_power < rx_min or rx_power > rx_max):
                 result = "error"
+                error_reasons.append(
+                    f"Rx光功率超出范围: {rx_power}dBm 范围: {rx_min}~{rx_max}dBm")
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Rx光功率异常: {rx_power}dBm{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Rx光功率异常: {rx_power}dBm 范围: {rx_min}~{rx_max}dBm{Style.RESET_ALL}")
         except (ValueError, TypeError):
             print(
                 f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {interface} Rx光功率解析失败: {data['rx_power']}{Style.RESET_ALL}")
+
+        # Check Tx Power
+        try:
+            tx_power = float(data["tx_power"].replace("dBm", ""))
+            tx_min, tx_max = extract_range_values(
+                tx_alarm_range if tx_alarm_range != "-" else tx_range)
+
+            if tx_min is not None and tx_max is not None and (tx_power < tx_min or tx_power > tx_max):
+                result = "error"
+                error_reasons.append(
+                    f"Tx光功率超出范围: {tx_power}dBm 范围: {tx_min}~{tx_max}dBm")
+                print(
+                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Tx光功率异常: {tx_power}dBm 范围: {tx_min}~{tx_max}dBm{Style.RESET_ALL}")
+        except (ValueError, TypeError):
+            print(
+                f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {interface} Tx光功率解析失败: {data['tx_power']}{Style.RESET_ALL}")
+
         # Check Bias
         try:
             bias = float(data["bias"].replace("mA", ""))
-            bias_range = re.findall(
-                r"\[(\d+)mA,\s*(\d+)mA\]", data["bias_range"])
-            if bias_range and (bias < float(bias_range[0][0]) or bias > float(bias_range[0][1])):
+            bias_min, bias_max = extract_range_values(
+                bias_alarm_range if bias_alarm_range != "-" else bias_range)
+
+            if bias_min is not None and bias_max is not None and (bias < bias_min or bias > bias_max):
                 result = "error"
+                error_reasons.append(
+                    f"偏置电流超出范围: {bias}mA 范围: {bias_min}~{bias_max}mA")
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} 偏置电流异常: {bias}mA, 范围: {data['bias_range']}{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} 偏置电流异常: {bias}mA 范围: {bias_min}~{bias_max}mA{Style.RESET_ALL}")
         except (ValueError, TypeError):
             print(
                 f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {interface} 偏置电流解析失败: {data['bias']}{Style.RESET_ALL}")
+
         # Check Voltage
         try:
             voltage = float(data["voltage"].replace("mV", ""))
-            voltage_range = re.findall(
-                r"\[(\d+)mV,\s*(\d+)mV\]", data["voltage_range"])
-            if voltage_range and (voltage < float(voltage_range[0][0]) or voltage > float(voltage_range[0][1])):
+            voltage_min, voltage_max = extract_range_values(
+                voltage_alarm_range if voltage_alarm_range != "-" else voltage_range)
+
+            if voltage_min is not None and voltage_max is not None and (voltage < voltage_min or voltage > voltage_max):
                 result = "error"
+                error_reasons.append(
+                    f"电压超出范围: {voltage}mV 范围: {voltage_min}~{voltage_max}mV")
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} 电压异常: {voltage}mV, 范围: {data['voltage_range']}{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} 电压异常: {voltage}mV 范围: {voltage_min}~{voltage_max}mV{Style.RESET_ALL}")
         except (ValueError, TypeError):
             print(
                 f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {interface} 电压解析失败: {data['voltage']}{Style.RESET_ALL}")
+
         # Check Temperature
         try:
             temp = float(data["temperature"].replace(" °C", ""))
-            temp_range = re.findall(
-                r"\[(-?\d+)\s*°C,\s*(\d+)\s*°C\]", data["temp_range"])
-            if temp_range and (temp < float(temp_range[0][0]) or temp > float(temp_range[0][1])):
+            temp_min, temp_max = extract_range_values(
+                temp_alarm_range if temp_alarm_range != "-" else temp_range)
+
+            if temp_min is not None and temp_max is not None and (temp < temp_min or temp > temp_max):
                 result = "error"
+                error_reasons.append(
+                    f"温度超出范围: {temp}°C 范围: {temp_min}~{temp_max}°C")
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} 温度异常: {temp}°C, 范围: {data['temp_range']}{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} 温度异常: {temp}°C 范围: {temp_min}~{temp_max}°C{Style.RESET_ALL}")
         except (ValueError, TypeError):
             print(
                 f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {interface} 温度解析失败: {data['temperature']}{Style.RESET_ALL}")
@@ -8104,33 +8244,157 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
             "wavelength": data["wavelength"],
             "distance": data["distance"],
             "rx_power": data["rx_power"],
-            "rx_range": data["rx_range"],
+            "rx_range": rx_range,  # Use converted range format
             "tx_power": data["tx_power"],
-            "tx_range": data["tx_range"],
+            "tx_range": tx_range,  # Use converted range format
             "bias": data["bias"],
-            "bias_range": data["bias_range"],
+            "bias_range": bias_range,  # Use converted range format
             "voltage": data["voltage"],
-            "voltage_range": data["voltage_range"],
+            "voltage_range": voltage_range,  # Use converted range format
             "temperature": data["temperature"],
-            "temp_range": data["temp_range"],
+            "temp_range": temp_range,  # Use converted range format
             "port_bw": data["port_bw"],
             "transceiver_bw": data["transceiver_bw"],
             "input_rate": data["input_rate"],
             "input_util": data["input_util"],
             "output_rate": data["output_rate"],
             "output_util": data["output_util"],
+            "crc": data["crc"],
             "neighbor_system_name": neighbor.get("system_name", "-"),
             "neighbor_system_description": neighbor.get("system_description", "-"),
             "neighbor_port": neighbor.get("port_id", "-"),
             "neighbor_ip": neighbor.get("ip", "-"),
-            "result": result
+            "result": result,
+            "error_reasons": "; ".join(error_reasons) if error_reasons else "-"
         })
         print(
             f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Result: {result}{Style.RESET_ALL}")
+        if error_reasons:
+            print(
+                f"{Fore.YELLOW}[DEBUG] 错误原因: {', '.join(error_reasons)}{Style.RESET_ALL}")
 
     if not results:
         print(f"{Fore.YELLOW}[WARNING] 设备 {ip} 未解析到光模块数据{Style.RESET_ALL}")
     return results
+
+
+def process_optical_module_worksheet(ws, host_ips, data, connection_failures, item):
+    """Process worksheet for optical module information."""
+    yellow_fill = PatternFill(start_color="FFFF00",
+                              end_color="FFFF00", fill_type="solid")
+    orange_fill = PatternFill(start_color="FFA500",
+                              end_color="FFA500", fill_type="solid")
+    center_alignment = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin")
+    )
+
+    total_results = 0
+    normal_results = 0
+    health_scores = {}
+    sheet_name = item['sheet_name']
+
+    headers = [
+        "网元类型", "网元名称", "网元IP", "接口名称", "当前状态", "最近UP时间", "最近DOWN时间",
+        "描述", "IPv4地址", "IPv6地址", "MAC地址", "最大传输单元(L3)", "厂商型号", "光模块类型",
+        "波长", "传输距离", "Rx光功率(dBm)", "Rx范围(dBm)", "Tx光功率(dBm)", "Tx范围(dBm)",
+        "偏置电流(mA)", "偏置范围(mA)", "电压(mV)", "电压范围(mV)", "温度(°C)", "温度范围(°C)",
+        "端口带宽", "光模块带宽", "输入速率(bps)", "输入带宽利用率", "输出速率(bps)", "输出带宽利用率",
+        "邻居系统名称", "邻居系统描述", "邻居端口", "邻居IP", "Result", "错误原因"
+    ]
+
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = yellow_fill
+        cell.alignment = center_alignment
+        cell.border = thin_border
+    print(f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
+
+    for ip in host_ips:
+        if ip in connection_failures:
+            continue
+        ne_type, device_name = "-", "-"
+        if ip in data and "show device" in data[ip]:
+            ne_type, device_name, _, _ = parse_uptime(data[ip]["show device"])
+
+        # 无接口数据的情况
+        if ip not in data or "show interface" not in data[ip]:
+            total_results += 1
+            ws.append([ne_type, device_name, ip] + ["无数据"] * 34 + ["error"])
+            for cell in ws[ws.max_row]:
+                cell.alignment = center_alignment
+                cell.border = thin_border
+            ws.cell(row=ws.max_row, column=len(headers) - 1).fill = orange_fill
+            print(f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无接口数据，写入子表{Style.RESET_ALL}")
+            continue
+
+        interface_output = data[ip]["show interface"]
+        lldp_output = data[ip].get("show lldp neighbor", "")
+        optical_data = parse_optical_module(
+            ip, interface_output, lldp_output, parse_uptime)
+
+        # 无光模块数据的情况
+        if not optical_data:
+            total_results += 1
+            ws.append([ne_type, device_name, ip] + ["无光模块数据"] * 34 + ["error"])
+            for cell in ws[ws.max_row]:
+                cell.alignment = center_alignment
+                cell.border = thin_border
+            ws.cell(row=ws.max_row, column=len(headers) - 1).fill = orange_fill
+            print(f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无光模块数据，写入子表{Style.RESET_ALL}")
+            continue
+
+        # 处理光模块数据
+        start_row = ws.max_row + 1
+        for row_data in optical_data:
+            total_results += 1
+            ws.append([
+                ne_type, device_name, ip,
+                row_data["interface"], row_data["current_state"], row_data["last_up"], row_data["last_down"],
+                sanitize_string(row_data["description"]),
+                row_data["ipv4"], row_data["ipv6"], row_data["mac"],
+                row_data["mtu_l3"], sanitize_string(row_data["vendor_pn"]),
+                sanitize_string(row_data["transceiver_id"]),
+                row_data["wavelength"], row_data["distance"], row_data["rx_power"], row_data["rx_range"],
+                row_data["tx_power"], row_data["tx_range"], row_data["bias"], row_data["bias_range"],
+                row_data["voltage"], row_data["voltage_range"], row_data["temperature"], row_data["temp_range"],
+                row_data["port_bw"], row_data["transceiver_bw"], row_data["input_rate"], row_data["input_util"],
+                row_data["output_rate"], row_data["output_util"],
+                sanitize_string(row_data["neighbor_system_name"]),
+                sanitize_string(row_data["neighbor_system_description"]),
+                sanitize_string(row_data["neighbor_port"]),
+                sanitize_string(row_data["neighbor_ip"]),
+                row_data["result"],
+                row_data.get("error_reasons", "-")
+            ])
+            for cell in ws[ws.max_row]:
+                cell.alignment = center_alignment
+                cell.border = thin_border
+            if row_data["result"] == "normal":
+                normal_results += 1
+            else:
+                ws.cell(row=ws.max_row, column=len(
+                    headers) - 1).fill = orange_fill
+
+        end_row = ws.max_row
+        if start_row < end_row:
+            for col in range(1, 4):
+                ws.merge_cells(start_row=start_row, start_column=col,
+                               end_row=end_row, end_column=col)
+        print(
+            f"{Fore.YELLOW}[DEBUG] 设备 {ip} 写入子表 {len(optical_data)} 行，合并单元格{Style.RESET_ALL}")
+
+    # 在所有数据处理完成后计算健康百分比
+    health_percentage = (normal_results / total_results *
+                         100) if total_results > 0 else 0
+    health_scores[sheet_name] = f"{health_percentage:.2f}%"
+    print(
+        f"{Fore.YELLOW}[DEBUG] 子表 {sheet_name} 健康百分比: {health_percentage:.2f}% ({normal_results}/{total_results}){Style.RESET_ALL}")
+
+    return health_scores
 
 
 def parse_power_status(output):
@@ -8151,7 +8415,8 @@ def parse_power_status(output):
             continue
         if in_table and line:
             parts = line.split()
-            if len(parts) >= 5:
+            # Check if the line has at least 6 parts to safely access parts[5]
+            if len(parts) >= 6:  # Updated to >= 6 since we need parts[5]
                 slot = parts[0]
                 voltage_mv = parts[4]
                 ratio = parts[5]
@@ -8167,6 +8432,10 @@ def parse_power_status(output):
                         f"{Fore.YELLOW}[WARNING] 电压解析失败: {voltage_mv}{Style.RESET_ALL}")
                     slot_voltages[slot] = {
                         "voltage": "-", "ratio": "-", "result": "error"}
+            else:
+                print(
+                    f"{Fore.YELLOW}[WARNING] 跳过无效行: {line} (列数不足){Style.RESET_ALL}")
+                continue  # Skip lines with insufficient columns
 
     # Check if slots 12 and 13 both have 0.0V and 0.00 ratio
     slots_12_13_zero = (
@@ -8209,33 +8478,46 @@ def parse_power_status(output):
 
 
 def parse_temperature(output):
-    """Parse 'show temperature' output for temperature status."""
+    """解析 'show temperature' 输出，获取温度状态，支持单温度和多槽位格式。"""
     print(f"{Fore.CYAN}[DEBUG] 开始解析 'show temperature' 输出{Style.RESET_ALL}")
     lines = output.split('\n')
     temperature_data = []
 
-    # Check if it's per-slot data (has "SLOT" in header)
-    if any("SLOT" in line for line in lines[:5]):
-        # Find the table start
-        for i, line in enumerate(lines):
-            if "SLOT" in line and "Temp" in line:
-                header_line = i
-                break
-        else:
-            print(f"{Fore.YELLOW}[WARNING] 未找到温度表头{Style.RESET_ALL}")
+    # 检查是否为多槽位格式（表头包含 "SLOT"）
+    header_line = None
+    for i, line in enumerate(lines[:5]):  # 限制在前5行查找表头
+        if "SLOT" in line:
+            header_line = line
+            break
+
+    if header_line:
+        # 解析表头，动态获取列索引
+        headers = header_line.split()
+        slot_idx = headers.index("SLOT") if "SLOT" in headers else None
+        temp_idx = headers.index("Temp") if "Temp" in headers else None
+        sen_01_idx = headers.index("SEN_01") if "SEN_01" in headers else None
+        sen_02_idx = headers.index("SEN_02") if "SEN_02" in headers else None
+        sen_03_idx = headers.index("SEN_03") if "SEN_03" in headers else None
+
+        if slot_idx is None:
+            print(f"{Fore.YELLOW}[WARNING] 未找到 'SLOT' 列{Style.RESET_ALL}")
             return None
 
-        # Parse per-slot temperature data
-        for line in lines[header_line + 2:]:
-            if line.strip().startswith('---') or not line.strip():
-                break
+        # 解析数据行
+        for line in lines[i + 1:]:
+            if not line.strip() or line.strip().startswith('---'):
+                continue
             parts = line.split()
-            if len(parts) >= 5:  # Ensure enough columns
-                slot = parts[0]
-                sensors = parts[4:]  # SEN_01, SEN_02, SEN_03, etc.
-                sen_01 = sensors[0] if len(sensors) > 0 else '--'
-                sen_02 = sensors[1] if len(sensors) > 1 else '--'
-                sen_03 = sensors[2] if len(sensors) > 2 else '--'
+            if len(parts) > slot_idx and parts[slot_idx].isdigit():
+                slot = parts[slot_idx]
+                temp = parts[temp_idx] if temp_idx is not None and temp_idx < len(
+                    parts) else "--"
+                sen_01 = parts[sen_01_idx] if sen_01_idx is not None and sen_01_idx < len(
+                    parts) else "--"
+                sen_02 = parts[sen_02_idx] if sen_02_idx is not None and sen_02_idx < len(
+                    parts) else "--"
+                sen_03 = parts[sen_03_idx] if sen_03_idx is not None and sen_03_idx < len(
+                    parts) else "--"
                 temperature_data.append({
                     'slot': slot,
                     'sen_01': sen_01,
@@ -8245,7 +8527,7 @@ def parse_temperature(output):
                 print(
                     f"{Fore.YELLOW}[DEBUG] 解析槽位 {slot}: SEN_01={sen_01}, SEN_02={sen_02}, SEN_03={sen_03}{Style.RESET_ALL}")
     else:
-        # Single temperature format
+        # 单温度格式
         for line in lines:
             if line.strip() and not line.strip().startswith('---') and not line.strip().startswith('SDK'):
                 parts = line.split()
@@ -8281,15 +8563,20 @@ def parse_fan(output):
         status = status_match.group(1)
         print(f"{Fore.YELLOW}[DEBUG] 提取风扇状态: {status}{Style.RESET_ALL}")
 
-    # Extract all fan speeds
-    speed_matches = re.findall(r"\[fan #\d+\]\s*(\d+%)\s*", output)
+    # Extract all fan speeds, including "stopping"
+    speed_matches = re.findall(r"\[fan #\d+\]\s*(\d+%|stopping)\s*", output)
     if speed_matches:
         fan_speeds = [f"[fan #{i+1:02d}] {speed}" for i,
                       speed in enumerate(speed_matches)]
         print(f"{Fore.YELLOW}[DEBUG] 提取风扇速度: {fan_speeds}{Style.RESET_ALL}")
 
-        # Check if any fan speed is below 20% or not a valid percentage
+        # Check if any fan speed is "stopping" or below 20%
         for speed in speed_matches:
+            if speed == "stopping":
+                result = "error"
+                print(
+                    f"{Fore.YELLOW}[DEBUG] 风扇速度 {speed} 为 stopping，设置 result 为 error{Style.RESET_ALL}")
+                break
             try:
                 speed_value = int(speed.rstrip("%"))
                 if speed_value < 20:  # Rule: fan speed < 20%
@@ -8305,7 +8592,7 @@ def parse_fan(output):
     else:
         result = "error"
         print(
-            f"{Fore.YELLOW}[DEBUG] 未找到风扇速度（非百分数值），设置 result 为 error{Style.RESET_ALL}")
+            f"{Fore.YELLOW}[DEBUG] 未找到风扇速度，设置 result 为 error{Style.RESET_ALL}")
 
     return {
         "status": status,  # Included for display, not used in result
@@ -8372,7 +8659,87 @@ def parse_version(output):
     return version_info
 
 
-def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, timeout=15, retry_count=5):
+def execute_some_command(channel, command, timeout=5, max_retries=3, command_delay=1):
+    """
+    执行命令并返回输出结果，处理分页提示，并在检测到特定错误时重试
+
+    Args:
+        channel: SSH通道
+        command: 要执行的命令
+        timeout: 总超时时间(秒)
+        max_retries: 最大重试次数
+        command_delay: 发送命令前等待的时间(秒)
+
+    Returns:
+        命令执行的输出结果
+    """
+    if not channel:
+        return ""
+
+    # 在发送命令前添加延迟，确保设备已准备好接收新命令
+    time.sleep(command_delay)  # 添加命令前延迟
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # 清空缓冲区并处理未完成的分页提示
+            while channel.recv_ready():
+                data = channel.recv(4096).decode('utf-8', 'ignore')
+                if '----MORE----' in data:
+                    channel.send(' ')
+                    time.sleep(0.5)  # 增加分页处理延迟
+
+            # 发送命令
+            channel.send(command + '\n')
+
+            # 等待命令开始执行 - 增加延迟
+            time.sleep(1.5)  # 从0.5增加到1.5秒
+
+            output = ""
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                rlist, _, _ = select.select([channel], [], [], 5.0)
+                if not rlist:
+                    logging.warning(f"命令 {command} 数据接收超时")
+                    break
+
+                data = channel.recv(65535).decode('utf-8', 'ignore')
+                output += data
+
+                # 检查最后一行的内容
+                lines = output.split('\n')
+                if lines:
+                    last_line = lines[-1].strip()
+                    if last_line == '----MORE----':
+                        channel.send(' ')
+                        time.sleep(0.5)  # 增加分页处理延迟
+                    elif last_line.endswith('>') or last_line.endswith('#') or last_line.endswith('$'):
+                        # 增加命令执行完成后的延迟，确保设备已完全处理
+                        time.sleep(0.5)  # 添加命令完成后延迟
+                        break
+
+            # 检查输出中是否包含错误信息
+            if "ERROR: Invalid input detected at '^' marker" not in output:
+                return output  # 成功执行
+            elif attempt < max_retries:
+                logging.warning(f"检测到错误，尝试重试 {attempt}/{max_retries}")
+                time.sleep(2)  # 在重试前等待时间从1秒增加到2秒
+            else:
+                logging.error(f"命令 {command} 达到最大重试次数")
+                return output  # 返回最后一次的输出
+
+        except socket.timeout:
+            logging.warning(f"命令执行超时: {command}")
+            return f"**命令执行超时**\n已执行部分输出:\n{output}"
+
+        except Exception as ex:
+            logging.error(f"执行命令出错: {ex}")
+            return f"**命令执行错误: {ex}**"
+
+    # 如果所有重试都失败，返回最后一次的输出
+    return output
+
+
+def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, timeout=15, retry_count=5, cmd_interval=1.5):
     """
     处理单个设备的多个命令执行
 
@@ -8385,6 +8752,7 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
         fail_log: 失败日志文件
         timeout: 连接超时时间(秒)
         retry_count: 连接重试次数
+        cmd_interval: 命令之间的间隔时间(秒)
     """
     file_lock = Lock()
     channel = None
@@ -8405,27 +8773,43 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
             return None
 
         # 设置终端不分页显示（优先尝试screen-length 0）
+        # 添加更长的延迟用于设备初始化和配置变更
+        time.sleep(1)  # 在设置终端特性前等待
+
         result = execute_some_command(
-            channel, "screen-length 0", timeout=1, max_retries=3)
+            channel, "screen-length 0", timeout=2, max_retries=3, command_delay=1)
         if "Error" in result or "ERROR: Invalid input detected at '^' marker" in result:
             # 尝试备用方案
+            time.sleep(1)  # 在尝试备用命令前等待
             execute_some_command(
-                channel, "screen-length 512", timeout=1, max_retries=3)
-        for cmd in commands:
+                channel, "screen-length 512", timeout=2, max_retries=3, command_delay=1)
+
+        # 在开始执行命令前先等待设备稳定
+        time.sleep(1)
+
+        for i, cmd in enumerate(commands):
             print(f"[DEBUG] 执行命令 {cmd} 于设备 {ip}")
             logging.info(f"设备 {ip} - 执行命令: {cmd}")
+
+            # 如果不是第一条命令，添加命令间延迟
+            if i > 0:
+                print(f"[INFO] 等待 {cmd_interval} 秒后执行下一命令...")
+                time.sleep(cmd_interval)  # 命令之间添加延迟
 
             # 在执行命令前记录PC时间
             pc_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
             # 执行命令，依赖 execute_some_command 的内置重试机制
+            # 增加命令延迟参数
             output = execute_some_command(
-                channel, cmd, timeout=10, max_retries=3)
+                channel, cmd, timeout=10, max_retries=3, command_delay=1.5)
 
             # 检查输出是否包含错误
             if "ERROR" in output or "ERROR: Invalid input detected at '^' marker" in output:
                 print(f"[WARNING] 命令 {cmd} 于设备 {ip} 执行失败: {output[:100]}...")
                 logging.warning(f"命令 {cmd} 于设备 {ip} 执行失败")
+                # 命令执行失败后添加额外延迟，防止设备过载
+                time.sleep(3)
 
             # 清理输出内容
             clean_output = "\n".join([
@@ -8469,13 +8853,16 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
         if channel:
             try:
                 # 无论是否异常，最终都尝试恢复默认分页设置
+                time.sleep(2)  # 等待一段时间后再恢复设置
                 execute_some_command(
-                    channel, "screen-length 25", timeout=1, max_retries=3)
+                    channel, "screen-length 25", timeout=2, max_retries=3, command_delay=1)
             except Exception as restore_error:
                 print(f"[WARNING] 恢复终端设置失败: {restore_error}")
                 logging.warning(f"设备 {ip} 恢复终端设置失败: {restore_error}")
             finally:
                 try:
+                    # 在关闭连接前等待，确保所有命令已完成处理
+                    time.sleep(2)
                     channel.close()
                 except Exception as close_error:
                     print(f"[WARNING] 关闭 {ip} 连接时出错: {close_error}")
@@ -9401,7 +9788,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 "波长", "传输距离", "Rx光功率(dBm)", "Rx范围(dBm)", "Tx光功率(dBm)", "Tx范围(dBm)",
                 "偏置电流(mA)", "偏置范围(mA)", "电压(mV)", "电压范围(mV)", "温度(°C)", "温度范围(°C)",
                 "端口带宽", "光模块带宽", "输入速率(bps)", "输入带宽利用率", "输出速率(bps)", "输出带宽利用率",
-                "邻居系统名称", "邻居系统描述", "邻居端口", "邻居IP", "Result"
+                "当前CRC", "邻居系统名称", "邻居系统描述", "邻居端口", "邻居IP", "Result", "备注"
             ]
             ws.append(headers)
             for cell in ws[1]:
@@ -9421,12 +9808,12 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show interface" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 33 + ["error"])
+                              ["无数据"] * 35 + ["error", "无接口数据"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     ws.cell(row=ws.max_row, column=len(
-                        headers)).fill = orange_fill
+                        headers) - 1).fill = orange_fill
                     print(
                         f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无接口数据，写入子表{Style.RESET_ALL}")
                     continue
@@ -9437,12 +9824,12 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if not optical_data:
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无光模块数据"] * 33 + ["error"])
+                              ["无光模块数据"] * 35 + ["error", "无光模块数据"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     ws.cell(row=ws.max_row, column=len(
-                        headers)).fill = orange_fill
+                        headers) - 1).fill = orange_fill
                     print(
                         f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无光模块数据，写入子表{Style.RESET_ALL}")
                     continue
@@ -9461,7 +9848,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         row_data["tx_power"], row_data["tx_range"], row_data["bias"], row_data["bias_range"],
                         row_data["voltage"], row_data["voltage_range"], row_data["temperature"], row_data["temp_range"],
                         row_data["port_bw"], row_data["transceiver_bw"], row_data["input_rate"], row_data["input_util"],
-                        row_data["output_rate"], row_data["output_util"],
+                        row_data["output_rate"], row_data["output_util"], row_data["crc"],
                         sanitize_string(
                             row_data["neighbor_system_name"]),  # 清理邻居系统名称
                         sanitize_string(
@@ -9469,7 +9856,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                             row_data["neighbor_system_description"]),
                         sanitize_string(row_data["neighbor_port"]),  # 清理邻居端口
                         sanitize_string(row_data["neighbor_ip"]),  # 清理邻居IP
-                        row_data["result"]
+                        row_data["result"], row_data["error_reasons"]
                     ])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
@@ -9478,7 +9865,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         normal_results += 1
                     else:
                         ws.cell(row=ws.max_row, column=len(
-                            headers)).fill = orange_fill
+                            headers) - 1).fill = orange_fill
                 end_row = ws.max_row
                 if start_row < end_row:
                     for col in range(1, 4):
@@ -10726,7 +11113,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             headers = ["网元类型", "网元名称", "网元IP", "时钟标识", "PTP状态", "时钟模式", "域值",
                        "从模式", "步进模式", "BMC优先级1", "BMC优先级2", "BMC时钟等级", "BMC时钟精度",
                        "当前时钟源(PTP)", "PTP实际状态", "GM时钟标识", "父时间标识", "父时钟跳数",
-                       "GM偏移统计(us)", "GM时钟源类型", "接收端口号", "端口WTR(s)", "时钟关系",
+                       "GM偏移统计(us)", "GM时钟源类型", "时钟端口", "端口WTR(s)", "时钟关系",
                        "通告超时", "SyncE当前时钟源", "SSM控制", "SSM输入门限",
                        "不对称方向", "延迟机制", "通告间隔(s)", "同步间隔(s)", "延迟请求间隔(s)",
                        "外部SyncE类型", "输出控制", "SaBit", "输出门限", "Result", "备注"]
@@ -10784,7 +11171,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                             device_info["父时钟跳数"] if i == 0 else "",
                             device_info["GM偏移统计(us)"] if i == 0 else "",
                             device_info["GM时钟源类型"] if i == 0 else "",
-                            port["接收端口号"],
+                            port["时钟端口"],
                             port["端口WTR(s)"],
                             port["时钟关系"],
                             port["通告超时"],
@@ -10807,7 +11194,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         total_results += 1  # 每个端口算一个检测项
                         if port["Result"] == "normal":
                             normal_results += 1
-                        
+
                         # 设置单元格样式
                         for cell in ws[ws.max_row]:
                             cell.alignment = center_alignment
@@ -10899,7 +11286,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                                  100) if total_devices > 0 else 0
             health_scores["登录失败设备"] = f"{health_percentage:.0f}%"
             item_counts["登录失败设备"] = (success_devices, total_devices)
-            
+
             # 计算健康度
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
@@ -10962,7 +11349,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "7",
             "光模块信息检查",
             "若光功率、偏置电流、电压或温度异常，检查光模块连接或更换光模块；若 CRC 错误过多，检查光纤链路或端口状态。",
-            "Rx 光功率 < -24dBm 或 > 4dBm（非 -40dBm），输出 'error'；偏置电流、电压或温度超出设备指定范围，输出 'error'；CRC 错误 > 2048，输出 'error'；光模块数据缺失，输出 'error'；否则输出 'normal'。",
+            "光功率、偏置电流、电压或温度超出设备指定范围，输出 'error'（收无光除外）；CRC 错误 > 2048，输出 'error'；光模块数据缺失，输出 'error'；否则输出 'normal'。",
             "show interface; show lldp neighbor"
         ],
         [
@@ -11558,7 +11945,7 @@ if __name__ == '__main__':
             host_file = getinput("host-stna.csv", "设备清单文件（默认：host-stna.csv）：")
             export_running_config(host_file)
         elif ucmd == '12':
-            print("\n🔧 运行配置清洗功能待实现，请提供具体清洗需求以完善功能。")
+            print("\n🔧 运行配置清洗功能待实现。")
             print(
                 f"\n{Fore.GREEN}✅ 接口光功率与CRC检查报告已生成：{report_file}{Style.RESET_ALL}")
         elif ucmd == '13':
@@ -11986,9 +12373,9 @@ if __name__ == '__main__':
                 raw_file = getinput("qa_raw.txt", "原始数据文件（默认：qa_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
-                _progress_bar(10, "🚀 设备会话就绪")
+                _progress_bar(9, "🚀 设备会话就绪")
                 fish_multiple_cmds(host_file, raw_file, commands)
-                _progress_bar(10, "🚀 清洗就绪")
+                _progress_bar(5, "🚀 清洗就绪")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
