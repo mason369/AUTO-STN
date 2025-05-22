@@ -4,8 +4,8 @@ STN-A设备巡检系统 v2.6
 更新说明：
 
 新增功能
-    系统运行状态:
-        PTP时钟检查
+    冗余与安全:
+        站点邻接网元检查
 - 修复若干BUG
         
 作者：杨茂森
@@ -56,10 +56,13 @@ from datetime import datetime
 import sys
 from itertools import cycle
 import pytz  # 需要导入 pytz 来处理时区
-
+from openpyxl.cell.cell import MergedCell
 import shutil
+
 # 初始化 colorama
 init(autoreset=True)
+# 初始化打印锁
+print_lock = Lock()
 
 
 def input_with_timeout(prompt, default, timeout=10):
@@ -172,12 +175,12 @@ def create_channel(ip, username, password, port=22, timeout=10, retry_count=3, r
     client = None
     for attempt in range(1, retry_count + 1):
         try:
-            print(
-                f"{Fore.CYAN}🔄 正在连接设备 {ip} (尝试 {attempt}/{retry_count})...{Style.RESET_ALL}")
+            with print_lock:
+                print(
+                    f"\n{Fore.CYAN}🔄 正在连接设备 {ip} (尝试 {attempt}/{retry_count})...{Style.RESET_ALL}")
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-            # 设置更多的连接选项提高稳定性
             client.connect(
                 hostname=ip,
                 port=port,
@@ -191,46 +194,55 @@ def create_channel(ip, username, password, port=22, timeout=10, retry_count=3, r
 
             channel = client.invoke_shell()
             channel.settimeout(timeout)
-            # 等待返回的信息，确认连接成功
             if channel.recv_ready():
                 _ = channel.recv(4096).decode('utf-8', 'ignore')
 
-            print(f"{Fore.GREEN}✅ 设备 {ip} 连接成功{Style.RESET_ALL}")
+            with print_lock:
+                print(f"\n{Fore.GREEN}✅ 设备 {ip} 连接成功{Style.RESET_ALL}")
             return channel
 
         except paramiko.AuthenticationException:
             client_close(client)
-            print(f"{Fore.RED}❌ 设备 {ip} 认证失败 - 用户名或密码错误{Style.RESET_ALL}")
+            with print_lock:
+                print(f"\n{Fore.RED}❌ 设备 {ip} 认证失败 - 用户名或密码错误{Style.RESET_ALL}")
             logging.error(f"设备 {ip} 认证失败 - 用户名或密码错误")
             raise ValueError("认证失败")
 
         except paramiko.SSHException as ssh_ex:
             client_close(client)
-            print(f"{Fore.YELLOW}⚠️ 设备 {ip} SSH异常: {ssh_ex}{Style.RESET_ALL}")
+            with print_lock:
+                print(
+                    f"\n{Fore.YELLOW}⚠️ 设备 {ip} SSH异常: {ssh_ex}{Style.RESET_ALL}")
             logging.warning(f"设备 {ip} SSH异常: {ssh_ex}")
 
         except socket.timeout:
             client_close(client)
-            print(f"{Fore.YELLOW}⌛ [连接响应超时] {ip} 请检查网络或设备负载{Style.RESET_ALL}")
+            with print_lock:
+                print(
+                    f"\n{Fore.YELLOW}⌛ [连接响应超时] {ip} 请检查网络或设备负载{Style.RESET_ALL}")
             logging.warning(f"设备 {ip} 连接超时")
 
         except socket.error as sock_ex:
             client_close(client)
-            print(f"{Fore.RED}🌐 设备 {ip} 网络错误: {sock_ex}{Style.RESET_ALL}")
+            with print_lock:
+                print(f"\n{Fore.RED}🌐 设备 {ip} 网络错误: {sock_ex}{Style.RESET_ALL}")
             logging.error(f"设备 {ip} 网络错误: {sock_ex}")
 
         except Exception as ex:
             client_close(client)
-            print(f"{Fore.RED}❗ 设备 {ip} 连接异常: {ex}{Style.RESET_ALL}")
+            with print_lock:
+                print(f"\n{Fore.RED}❗ 设备 {ip} 连接异常: {ex}{Style.RESET_ALL}")
             logging.error(f"设备 {ip} 连接异常: {ex}")
 
         if attempt < retry_count:
-            retry_time = retry_delay * attempt  # 指数退避策略
-            print(f"{Fore.CYAN}⏳ 等待{retry_time}秒后重试...{Style.RESET_ALL}")
+            retry_time = retry_delay * attempt
+            with print_lock:
+                print(f"\n{Fore.CYAN}⏳ 等待{retry_time}秒后重试...{Style.RESET_ALL}")
             time.sleep(retry_time)
         else:
             logging.error(f"设备 {ip} 连接失败，已达到最大重试次数")
-            print(f"{Fore.RED}🚫 设备 {ip} 连接失败，已达到最大重试次数{Style.RESET_ALL}")
+            with print_lock:
+                print(f"\n{Fore.RED}🚫 设备 {ip} 连接失败，已达到最大重试次数{Style.RESET_ALL}")
 
     return None
 
@@ -300,7 +312,7 @@ def execute_some_command(channel, command, timeout=5, max_retries=3, command_del
                     for i in range(3):
                         print(f"{Fore.RED}{error_msg}{Style.RESET_ALL}")
                         logging.critical(error_msg)
-                    
+
                     # 终止程序
                     sys.exit(1)
 
@@ -351,9 +363,9 @@ def config_host(channel, filename, revfile, ipaddr='', device_name='', cmd_delay
                     time.sleep(cmd_delay)
 
                 result = execute_some_command(
-                    channel, cmd[0]+'\n', timeout=5, command_delay=1.5, 
+                    channel, cmd[0]+'\n', timeout=5, command_delay=1.5,
                     device_name=device_name, ip=ipaddr)
-                
+
                 for line in splitstr(result):
                     try:
                         revfile.write(f"{ipaddr} , {cmd[0]} , {line}\n")
@@ -369,8 +381,7 @@ def config_host(channel, filename, revfile, ipaddr='', device_name='', cmd_delay
         time.sleep(2)
         # 恢复分页设置
         execute_some_command(channel, 'screen-length 25',
-                         timeout=2, command_delay=1, device_name=device_name, ip=ipaddr)
-
+                             timeout=2, command_delay=1, device_name=device_name, ip=ipaddr)
 
 
 # 执行一跳CLI指令并保存结果
@@ -1279,7 +1290,7 @@ def process_device1(ip, user, pwd, cmd, index, total_devices, revFile, total_att
             ip=ip,
             username=user,     # Changed from user to username
             password=pwd,      # Changed from pwd to password
-            retry_count=3 
+            retry_count=3
         )
 
         # 处理连接结果
@@ -5449,6 +5460,54 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=20):
     print(f"{Fore.CYAN}[END] QA巡检数据采集完成{Style.RESET_ALL}")
 
 
+def parse_ldp_lsp(ldp_output, ne_type, ne_name, ne_ip):
+    """解析LDP LSP输出，检测链路邻接状态"""
+    # 初始化结果列表
+    result_data = []
+
+    # 将输出按行分割
+    lines = ldp_output.splitlines()
+
+    # 使用正则表达式提取FEC和下一跳地址
+    next_hops = set()  # 使用集合存储唯一的下一跳地址
+    for line in lines:
+        fec_match = re.match(r'FEC IPV4:(\S+) -> (\S+)', line.strip())
+        if fec_match:
+            next_jump = fec_match.group(2)
+            # 忽略 none 和 0.0.0.0
+            if next_jump not in ["none", "0.0.0.0"]:
+                next_hops.add(next_jump)
+
+    # 如果没有有效下一跳，返回默认行
+    if not next_hops:
+        return [{
+            "网元类型": ne_type,
+            "网元名称": ne_name,
+            "网元IP": ne_ip,
+            "保护条目数": 0,
+            "链路下一跳": "-",
+            "Result": "error"
+        }]
+
+    # 计算保护条目数和链路下一跳
+    protection_count = len(next_hops)
+    next_hop_str = ", ".join(sorted(next_hops))  # 将下一跳地址按顺序拼接
+    result = "normal" if protection_count >= 2 else "error"
+
+    # 生成结果行
+    row = {
+        "网元类型": ne_type,
+        "网元名称": ne_name,
+        "网元IP": ne_ip,
+        "保护条目数": protection_count,
+        "链路下一跳": next_hop_str,
+        "Result": result
+    }
+    result_data.append(row)
+
+    return result_data
+
+
 def parse_ptp_clock_status(ptp_output, synce_output, ne_type, device_name, ip):
     """
     Enhanced parser for PTP clock status data, supporting multiple receiving ports
@@ -6096,10 +6155,10 @@ def parse_snmp_config(trap_output, community_output, mib_view_output, sys_info_o
 
     # Apply rules and generate remarks
     remarks = []
-    if snmp_data["SNMP版本"] not in ["v3"]:
-        remarks.append("SNMP版本未启用v3加密协议，存在安全风险，建议升级至SNMPv3并启用加密认证。")
-    if any(ip == "0.0.0.0" for ip in snmp_data["社区绑定IP"]):
-        remarks.append("绑定IP为0.0.0.0导致社区字符串暴露于全网，建议限制为特定管理网段（如4.148.32.0/24）。")
+    # if snmp_data["SNMP版本"] not in ["v3"]:
+    #     remarks.append("SNMP版本未启用v3加密协议，存在安全风险，建议升级至SNMPv3并启用加密认证。")
+    # if any(ip == "0.0.0.0" for ip in snmp_data["社区绑定IP"]):
+    #     remarks.append("绑定IP为0.0.0.0导致社区字符串暴露于全网，建议限制为特定管理网段（如4.148.32.0/24）。")
     # Additional rules can be added here (e.g., Trap Host IP validity, Community string security)
 
     if remarks:
@@ -6189,24 +6248,24 @@ def parse_device_accounts(users_output, login_rule_output, logging_user_output):
 
     # 应用规则并生成备注
     remarks = []
-    try:
-        lock_minutes = int(account_data["锁定分钟数"])
-        if lock_minutes < 30:
-            remarks.append("锁定时间过短（{}分钟），建议设置为30分钟以上。".format(lock_minutes))
-    except ValueError:
-        pass
-    try:
-        max_attempts = int(account_data["最大尝试次数"])
-        if max_attempts > 5:
-            remarks.append("最大尝试次数过多（{}次），建议设置为5次以下。".format(max_attempts))
-    except ValueError:
-        pass
-    try:
-        reuse_checks = int(account_data["密码重用检查次数"])
-        if reuse_checks < 3:
-            remarks.append("密码重用检查次数不足（{}次），建议设置为3次以上。".format(reuse_checks))
-    except ValueError:
-        pass
+    # try:
+    #     lock_minutes = int(account_data["锁定分钟数"])
+    #     if lock_minutes < 30:
+    #         remarks.append("锁定时间过短（{}分钟），建议设置为30分钟以上。".format(lock_minutes))
+    # except ValueError:
+    #     pass
+    # try:
+    #     max_attempts = int(account_data["最大尝试次数"])
+    #     if max_attempts > 5:
+    #         remarks.append("最大尝试次数过多（{}次），建议设置为5次以下。".format(max_attempts))
+    # except ValueError:
+    #     pass
+    # try:
+    #     reuse_checks = int(account_data["密码重用检查次数"])
+    #     if reuse_checks < 3:
+    #         remarks.append("密码重用检查次数不足（{}次），建议设置为3次以上。".format(reuse_checks))
+    # except ValueError:
+    #     pass
 
     if remarks:
         account_data["备注"] = "; ".join(remarks)
@@ -6278,11 +6337,11 @@ def parse_ospf_routing_table(output):
             uptime_secs = parse_uptime(uptime)
 
             # 规则检查
-            if cost_val > 2000:
-                remarks.append(f"Cost值过高（{cost_val} > 2000），可能导致次优路径选择或环路")
+            if cost_val > 4000:
+                remarks.append(f"Cost值过高（{cost_val} > 4000），可能导致次优路径选择或环路")
             if uptime_secs < 3600:  # 小于1小时
                 uptime_str = str(timedelta(seconds=uptime_secs))
-                remarks.append(f"Uptime < 1小时（{uptime_str}），若路由频繁更新，可能导致环路")
+                remarks.append(f"Uptime < 1小时（{uptime_str}），区域内OSPF有刷新")
 
             # 只有异常的条目才加入结果
             if remarks:
@@ -6305,19 +6364,16 @@ def parse_ospf_routing_table(output):
     return routes if routes else []
 
 
-def parse_ldp_session_status(output, lsp_output):
-    """解析 show ldp session 和 show ldp lsp 命令输出"""
+def parse_ldp_session_status(output):
+    """解析 show ldp session 命令输出"""
     sessions = []
     lines = output.split('\n')
     session_section = False
 
     # 正则表达式匹配会话条目
     session_pattern = re.compile(
-        r'(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)'
+        r'(\S+)\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+(?:\s+\S+)*?)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)'
     )
-
-    # 解析 LSP 数据
-    lsp_data = parse_ldp_lsp(lsp_output)
 
     for line in lines:
         line = line.strip()
@@ -6327,188 +6383,39 @@ def parse_ldp_session_status(output, lsp_output):
         if not session_section or not line:
             continue
 
+        # 尝试匹配会话行
         match = session_pattern.search(line)
         if match:
-            peer_type, peer_ip, interface, role, state, keepalive, uptime = match.groups()
-            lsp_info = lsp_data.get(
-                peer_ip, {"state": "-", "down_label": "-", "up_label": "-"})
+            peer_type, vc_type, peer_ip, interface, role, state, keepalive, uptime = match.groups()
 
-            # 检查巡检规则
-            result = "normal"
-            remarks = []
+            # 处理对端类型
+            peer_type_full = f"{peer_type} {vc_type}".strip(
+            ) if vc_type != "vc" else peer_type
 
-            # 规则 1: 会话状态
-            if state != "OPERATIONAL":
-                result = "error"
-                if state == "NON_EXISTENT":
-                    remarks.append(
-                        "会话状态为NON_EXISTENT，会话不存在，建议检查链路连通性、LDP配置或协议协商问题")
-                else:
-                    remarks.append(
-                        "会话状态非OPERATIONAL，可能未正常建立，建议检查链路连通性、LDP配置或协议协商问题")
+            # 检查会话状态，设置 Result
+            result = "normal" if state == "OPERATIONAL" else "error"
 
-            # 规则 2: 对端 IP
-            if peer_ip in ["0.0.0.0", "127.0.0.1"]:
-                result = "error"
-                remarks.append("对端IP为无效地址，可能配置错误，建议检查LDP对端配置")
-
-            # 规则 6: LSP 状态
-            if lsp_info["state"] != "Established":
-                result = "error"
-                down_label = lsp_info["down_label"] if lsp_info["down_label"] != "-" else "无"
-                up_label = lsp_info["up_label"] if lsp_info["up_label"] != "-" else "无"
-                remarks.append(
-                    f"LSP状态非Established，标签分发失败，下游标签: {down_label}，上游标签: {up_label}，"
-                    f"建议检查路由可达性、标签资源或策略限制"
-                )
+            # 设置备注
+            remark = "会话正常" if result == "normal" else f"会话状态异常: {state}"
 
             session = {
+                "对端类型": peer_type_full,
                 "对端IP": peer_ip,
                 "接口名称": interface.strip(),
                 "角色": role,
                 "会话状态": state,
                 "KeepAlive时间": f"{keepalive}s",
                 "运行时间": uptime,
-                "LSP状态": lsp_info["state"],
-                "下游标签": lsp_info["down_label"],
-                "上游标签": lsp_info["up_label"],
                 "Result": result,
-                "备注": "; ".join(remarks) if remarks else "-"
+                "备注": remark
             }
             sessions.append(session)
 
-    return sessions if sessions else [{"对端IP": "无条目"}]
+    # 如果没有会话条目，返回"无会话"
+    if not sessions:
+        sessions = [{"对端IP": "无会话"}]
 
-
-def parse_ldp_lsp(output):
-    lsp_data = {}
-    lines = output.split('\n')
-    current_peer = None
-
-    for line in lines:
-        line = line.strip()
-        if line.startswith('FEC IPV4:'):
-            parts = line.split(' -> ')
-            if len(parts) == 2:
-                peer_ip = parts[1].split()[0]
-                current_peer = peer_ip
-                lsp_data[current_peer] = {
-                    "state": "Established", "down_label": [], "up_label": []}
-            else:
-                print(f"[DEBUG] 行格式不正确: {line}")
-        elif line.startswith('Downstream state:') or line.startswith('Upstream state:'):
-            if 'state:' in line:  # 检查是否包含 'state:'
-                parts = line.split('state:')
-                if len(parts) == 2 and parts[1].strip():  # 确保 'state:' 后有内容
-                    state = parts[1].split()[0]
-                    label_match = re.search(r'Label:\s*(\S+)', line)
-                    label = label_match.group(1) if label_match else "-"
-                    if current_peer:
-                        if state != "Established":
-                            lsp_data[current_peer]["state"] = state
-                        if line.startswith('Downstream state:'):
-                            lsp_data[current_peer]["down_label"].append(label)
-                        elif line.startswith('Upstream state:'):
-                            lsp_data[current_peer]["up_label"].append(label)
-                else:
-                    print(f"[DEBUG] 行中 'state:' 后无有效内容: {line}")
-            else:
-                print(f"[DEBUG] 行中没有 'state:': {line}")
-
-    # 处理标签显示
-    for peer, info in lsp_data.items():
-        info["down_label"] = "多种标签" if len(info["down_label"]) > 1 else (
-            info["down_label"][0] if info["down_label"] else "无")
-        info["up_label"] = "多种标签" if len(info["up_label"]) > 1 else (
-            info["up_label"][0] if info["up_label"] else "无")
-
-    return lsp_data
-
-
-def process_ldp_session_check(ws, host_ips, data, connection_failures, yellow_fill, orange_fill, center_alignment, thin_border):
-    """处理 LDP 异常会话状态检查并生成巡检报告"""
-    headers = [
-        "网元类型", "网元名称", "网元IP", "对端IP", "接口名称", "角色", "会话状态",
-        "KeepAlive时间", "运行时间", "LSP状态", "下游标签", "上游标签", "Result", "备注"
-    ]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.fill = yellow_fill
-        cell.alignment = center_alignment
-        cell.border = thin_border
-
-    total_results = 0
-    normal_results = 0
-
-    for ip in host_ips:
-        if ip in connection_failures:
-            continue
-        ne_type, device_name = "-", "-"
-        device_ip = ip
-        if ip in data and "show device" in data[ip]:
-            ne_type, device_name, _, parsed_ip = parse_uptime(
-                data[ip]["show device"])
-            if parsed_ip and re.match(r'\d+\.\d+\.\d+\.\d+', parsed_ip):
-                device_ip = parsed_ip
-
-        session_output = data[ip].get("show ldp session", "")
-        lsp_output = data[ip].get("show ldp lsp", "")
-        ldp_data = parse_ldp_session_status(session_output, lsp_output)
-
-        if not ldp_data or ldp_data[0].get("对端IP") == "无条目":
-            total_results += 1
-            normal_results += 1
-            # 使用“无异常条目”代替“无条目”
-            ws.append([ne_type, device_name, device_ip] +
-                      ["无异常条目"] * 9 + ["normal", "-"])
-            for cell in ws[ws.max_row]:
-                cell.alignment = center_alignment
-                cell.border = thin_border
-        else:
-            start_row = ws.max_row + 1
-            has_error = False
-            for row_data in ldp_data:
-                result = row_data.get("Result", "normal")
-                total_results += 1
-                if result == "error":
-                    has_error = True
-                    row = [
-                        ne_type, device_name, device_ip,
-                        row_data.get("对端IP", "-"),
-                        row_data.get("接口名称", "-"),
-                        row_data.get("角色", "-"),
-                        row_data.get("会话状态", "-"),
-                        row_data.get("KeepAlive时间", "-"),
-                        row_data.get("运行时间", "-"),
-                        row_data.get("LSP状态", "-"),
-                        row_data.get("下游标签", "-"),
-                        row_data.get("上游标签", "-"),
-                        result,
-                        row_data.get("备注", "-")
-                    ]
-                    ws.append(row)
-                    for cell in ws[ws.max_row]:
-                        cell.alignment = center_alignment
-                        cell.border = thin_border
-                    ws.cell(row=ws.max_row, column=13).fill = orange_fill
-                else:
-                    normal_results += 1
-
-            if not has_error:
-                ws.append([ne_type, device_name, device_ip] +
-                          ["正常"] * 9 + ["normal", "-"])
-                for cell in ws[ws.max_row]:
-                    cell.alignment = center_alignment
-                    cell.border = thin_border
-                end_row = ws.max_row
-                if start_row < end_row:
-                    for col in range(1, 4):
-                        ws.merge_cells(
-                            start_row=start_row, start_column=col, end_row=end_row, end_column=col)
-
-    health_percentage = (normal_results / total_results *
-                         100) if total_results > 0 else 0
-    return f"{health_percentage:.0f}%"
+    return sessions
 
 
 def parse_ospf_buffers(output):
@@ -6643,10 +6550,10 @@ def check_ospf_neighbor(neighbor, buffers):
         if lsa_buf < 2048:
             remarks.append("LSA缓冲区过小")
             result = "error"
-        if packet_unused < 10:
+        if packet_unused < 2:
             remarks.append("未使用包列表过少")
             result = "normal"
-        if lsa_unused < 20:
+        if lsa_unused < 2:
             remarks.append("未使用LSA列表过少")
             result = "normal"
     state = neighbor.get('state', '-')
@@ -7119,10 +7026,10 @@ def check_ospf_process(session, output):
     total_lsa = session.get('total_lsa', '0').replace(',', '')
     try:
         total_lsa = int(total_lsa)
-        if total_lsa > 1000:
+        if total_lsa > 2000:
             remarks.append("❗ LSA总数过多")
             result = "error"
-        elif total_lsa > 800:
+        elif total_lsa > 1800:
             remarks.append("⚠️ LSA总数接近临界值，需监控增长趋势")
     except ValueError:
         remarks.append("⚠️ LSA总数解析失败")
@@ -7132,8 +7039,8 @@ def check_ospf_process(session, output):
     external_lsa = session.get('external_lsa', '0').replace(',', '')
     try:
         external_lsa = int(external_lsa)
-        if external_lsa > 500:
-            remarks.append("❗ 外部LSA数暴增，需检查路由重分发或泛洪攻击")
+        if external_lsa > 800:
+            remarks.append("❗ 外部LSA数过多，需检查路由重分发或泛洪攻击")
             result = "error"
     except ValueError:
         remarks.append("⚠️ 外部LSA数解析失败")
@@ -7145,15 +7052,17 @@ def check_ospf_process(session, output):
     try:
         interfaces = int(interfaces)
         adjacencies = int(adjacencies)
-        if interfaces > 2 and adjacencies < (interfaces - 2):
-            remarks.append("⚠️ 邻接数少于预期，可能因网络类型或配置问题")
-            if adjacencies == 0:
-                remarks.append("❗ 无邻接，可能OSPF未激活或认证错误")
+        if interfaces > 2:
+            if adjacencies < 2:  # 修改为检查邻接数 < 2
+                remarks.append("⚠️ 邻接数少于2")
                 result = "error"
+                if adjacencies == 0:
+                    remarks.append("❗ 无邻接，可能OSPF未激活或认证错误")
+            elif adjacencies < (interfaces - 2):  # 保留原有逻辑作为次要检查
+                remarks.append("⚠️ 邻接数少于预期(邻接数≥接口数-2)")
     except ValueError:
         remarks.append("⚠️ 邻接或接口数解析失败")
         pass
-
     # 5. Uptime anomaly (< 10 minutes)
     uptime = session.get('uptime', '')
     if "minutes" in uptime and not ("days" in uptime or "day" in uptime):
@@ -8659,86 +8568,6 @@ def parse_version(output):
     return version_info
 
 
-def execute_some_command(channel, command, timeout=5, max_retries=3, command_delay=1):
-    """
-    执行命令并返回输出结果，处理分页提示，并在检测到特定错误时重试
-
-    Args:
-        channel: SSH通道
-        command: 要执行的命令
-        timeout: 总超时时间(秒)
-        max_retries: 最大重试次数
-        command_delay: 发送命令前等待的时间(秒)
-
-    Returns:
-        命令执行的输出结果
-    """
-    if not channel:
-        return ""
-
-    # 在发送命令前添加延迟，确保设备已准备好接收新命令
-    time.sleep(command_delay)  # 添加命令前延迟
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            # 清空缓冲区并处理未完成的分页提示
-            while channel.recv_ready():
-                data = channel.recv(4096).decode('utf-8', 'ignore')
-                if '----MORE----' in data:
-                    channel.send(' ')
-                    time.sleep(0.5)  # 增加分页处理延迟
-
-            # 发送命令
-            channel.send(command + '\n')
-
-            # 等待命令开始执行 - 增加延迟
-            time.sleep(1.5)  # 从0.5增加到1.5秒
-
-            output = ""
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                rlist, _, _ = select.select([channel], [], [], 5.0)
-                if not rlist:
-                    logging.warning(f"命令 {command} 数据接收超时")
-                    break
-
-                data = channel.recv(65535).decode('utf-8', 'ignore')
-                output += data
-
-                # 检查最后一行的内容
-                lines = output.split('\n')
-                if lines:
-                    last_line = lines[-1].strip()
-                    if last_line == '----MORE----':
-                        channel.send(' ')
-                        time.sleep(0.5)  # 增加分页处理延迟
-                    elif last_line.endswith('>') or last_line.endswith('#') or last_line.endswith('$'):
-                        # 增加命令执行完成后的延迟，确保设备已完全处理
-                        time.sleep(0.5)  # 添加命令完成后延迟
-                        break
-
-            # 检查输出中是否包含错误信息
-            if "ERROR: Invalid input detected at '^' marker" not in output:
-                return output  # 成功执行
-            elif attempt < max_retries:
-                logging.warning(f"检测到错误，尝试重试 {attempt}/{max_retries}")
-                time.sleep(2)  # 在重试前等待时间从1秒增加到2秒
-            else:
-                logging.error(f"命令 {command} 达到最大重试次数")
-                return output  # 返回最后一次的输出
-
-        except socket.timeout:
-            logging.warning(f"命令执行超时: {command}")
-            return f"**命令执行超时**\n已执行部分输出:\n{output}"
-
-        except Exception as ex:
-            logging.error(f"执行命令出错: {ex}")
-            return f"**命令执行错误: {ex}**"
-
-    # 如果所有重试都失败，返回最后一次的输出
-    return output
-
-
 def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, timeout=15, retry_count=5, cmd_interval=1.5):
     """
     处理单个设备的多个命令执行
@@ -8788,12 +8617,14 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
         time.sleep(1)
 
         for i, cmd in enumerate(commands):
-            print(f"[DEBUG] 执行命令 {cmd} 于设备 {ip}")
+            with print_lock:
+                print(f"[DEBUG] 执行命令 {cmd} 于设备 {ip}")
             logging.info(f"设备 {ip} - 执行命令: {cmd}")
 
             # 如果不是第一条命令，添加命令间延迟
             if i > 0:
-                print(f"[INFO] 等待 {cmd_interval} 秒后执行下一命令...")
+                with print_lock:
+                    print(f"[INFO] 等待 {cmd_interval} 秒后执行下一命令...")
                 time.sleep(cmd_interval)  # 命令之间添加延迟
 
             # 在执行命令前记录PC时间
@@ -8806,7 +8637,9 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
 
             # 检查输出是否包含错误
             if "ERROR" in output or "ERROR: Invalid input detected at '^' marker" in output:
-                print(f"[WARNING] 命令 {cmd} 于设备 {ip} 执行失败: {output[:100]}...")
+                with print_lock:
+                    print(
+                        f"[WARNING] 命令 {cmd} 于设备 {ip} 执行失败: {output[:500]}...")
                 logging.warning(f"命令 {cmd} 于设备 {ip} 执行失败")
                 # 命令执行失败后添加额外延迟，防止设备过载
                 time.sleep(3)
@@ -8823,9 +8656,10 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
             clean_output_with_time = f"PC_TIME: {pc_time}\n{clean_output}"
 
             # 输出前500个字符用于调试
-            output_preview = clean_output[:500] + \
-                "..." if len(clean_output) > 500 else clean_output
-            print(f"[DEBUG] 设备 {ip} 命令 {cmd} 输出(预览): {output_preview}")
+            output_preview = clean_output[:800] + \
+                "..." if len(clean_output) > 800 else clean_output
+            with print_lock:
+                print(f"[DEBUG] 设备 {ip} 命令 {cmd} 输出(预览): {output_preview}")
 
             # 安全写入输出结果
             with file_lock:
@@ -8833,7 +8667,8 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
                     writer.writerow([ip, cmd, clean_output_with_time])
                 except Exception as write_err:
                     logging.error(f"写入CSV时出错: {write_err}")
-                    print(f"[ERROR] 写入结果到CSV时出错: {write_err}")
+                    with print_lock:
+                        print(f"[ERROR] 写入结果到CSV时出错: {write_err}")
 
     except ValueError as auth_error:
         print(f"[WARNING] 设备 {ip} 认证失败: {auth_error}")
@@ -9308,7 +9143,6 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         cell.font = header_font
         cell.alignment = center_alignment
         cell.border = thin_border
-
     # Read host file
     with open(host_file, "r", encoding='gbk', errors='ignore') as f:
         reader = csv.reader(f)
@@ -10173,7 +10007,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
 
-        elif item['name'] == "BFD会话检查(VC业务BFD检查)":
+        elif item['name'] == "BFD会话检查(VC业务统计)":
             headers = [
                 "网元类型", "网元名称", "网元IP", "APS组ID", "会话名称", "本地ID", "远端ID", "状态", "主备角色",
                 "发送间隔", "接收间隔", "检测倍数", "本地鉴别器", "远端鉴别器", "鉴别器状态", "首次报文接收",
@@ -10686,10 +10520,10 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
 
-        elif item['name'] == "LDP 异常会话状态检查":
+        elif item['name'] == "LDP 会话状态检查":
             headers = [
-                "网元类型", "网元名称", "网元IP", "对端IP", "接口名称", "角色", "会话状态",
-                "KeepAlive时间", "运行时间", "LSP状态", "下游标签", "上游标签", "Result", "备注"
+                "网元类型", "网元名称", "网元IP", "对端类型", "对端IP", "接口名称",
+                "角色", "会话状态", "KeepAlive时间", "运行时间", "Result", "备注"
             ]
             ws.append(headers)
             for cell in ws[1]:
@@ -10709,53 +10543,57 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         device_ip = parsed_ip
 
                 session_output = data[ip].get("show ldp session", "")
-                lsp_output = data[ip].get("show ldp lsp", "")
-                ldp_data = item['parser'](session_output, lsp_output)
+                ldp_data = parse_ldp_session_status(session_output)
 
-                if not ldp_data or ldp_data[0].get("对端IP") == "无条目":
+                if not ldp_data or (len(ldp_data) == 1 and ldp_data[0].get("对端IP") == "无会话"):
+                    # 如果没有LDP会话，显示一行表示无会话
                     total_results += 1
                     normal_results += 1
-                    ws.append([ne_type, device_name, device_ip] +
-                              ["无异常"] * 9 + ["normal", "-"])
+                    ws.append([ne_type, device_name, device_ip, "-", "无会话",
+                              "-", "-", "-", "-", "-", "normal", "无LDP会话"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                 else:
+                    # 显示所有LDP会话的详细信息
                     start_row = ws.max_row + 1
                     has_error = False
+
                     for row_data in ldp_data:
                         result = row_data.get("Result", "normal")
                         total_results += 1
+
                         if result == "error":
                             has_error = True
-                            row = [
-                                ne_type, device_name, device_ip,
-                                row_data.get("对端IP", "-"),
-                                row_data.get("接口名称", "-"),
-                                row_data.get("角色", "-"),
-                                row_data.get("会话状态", "-"),
-                                row_data.get("KeepAlive时间", "-"),
-                                row_data.get("运行时间", "-"),
-                                row_data.get("LSP状态", "-"),
-                                row_data.get("下游标签", "-"),
-                                row_data.get("上游标签", "-"),
-                                result,
-                                row_data.get("备注", "-")
-                            ]
-                            ws.append(row)
-                            for cell in ws[ws.max_row]:
-                                cell.alignment = center_alignment
-                                cell.border = thin_border
-                            ws.cell(row=ws.max_row,
-                                    column=13).fill = orange_fill
-                        else:
+
+                        if result == "normal":
                             normal_results += 1
-                    if not has_error:
-                        ws.append([ne_type, device_name, device_ip] +
-                                  ["无异常"] * 9 + ["normal", "-"])
+
+                        row = [
+                            ne_type,
+                            device_name,
+                            device_ip,
+                            row_data.get("对端类型", "-"),
+                            row_data.get("对端IP", "-"),
+                            row_data.get("接口名称", "-"),
+                            row_data.get("角色", "-"),
+                            row_data.get("会话状态", "-"),
+                            row_data.get("KeepAlive时间", "-"),
+                            row_data.get("运行时间", "-"),
+                            result,
+                            row_data.get("备注", "-")
+                        ]
+                        ws.append(row)
                         for cell in ws[ws.max_row]:
                             cell.alignment = center_alignment
                             cell.border = thin_border
+
+                        # 如果是错误状态，标记为橙色
+                        if result == "error":
+                            ws.cell(row=ws.max_row,
+                                    column=11).fill = orange_fill
+
+                    # 合并相同设备的前三列（网元类型、网元名称、网元IP）
                     end_row = ws.max_row
                     if start_row < end_row:
                         for col in range(1, 4):
@@ -11261,37 +11099,98 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         cell.border = thin_border
 
             # Create login failure sub-sheet
-            ws_failure = wb.create_sheet(title="登录失败设备")
-            headers = ["网元IP", "故障原因"]
-            ws_failure.append(headers)
-            for cell in ws_failure[1]:
-                cell.fill = yellow_fill
-                cell.alignment = center_alignment
-                cell.border = thin_border
-                cell.font = header_font
-
-            total_failures = len(connection_failures)
-            total_devices = len(host_ips)
-            success_devices = total_devices - total_failures
-            for ip in sorted(connection_failures.keys()):
-                reason = connection_failures[ip]
-                ws_failure.append([ip, reason])
-                for cell in ws_failure[ws_failure.max_row]:
-                    cell.alignment = center_alignment
-                    cell.border = thin_border
-                ws_failure.cell(row=ws_failure.max_row,
-                                column=2).fill = orange_fill
-
-            health_percentage = (success_devices / total_devices *
-                                 100) if total_devices > 0 else 0
-            health_scores["登录失败设备"] = f"{health_percentage:.0f}%"
-            item_counts["登录失败设备"] = (success_devices, total_devices)
 
             # 计算健康度
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+
+        elif item['name'] == "站点邻接网元检查":
+            headers = ["网元类型", "网元名称", "网元IP", "邻接条目数", "下一跳邻接地址", "Result"]
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.fill = yellow_fill
+                cell.alignment = center_alignment
+                cell.border = thin_border
+
+            total_results = 0
+            normal_results = 0
+            for ip in sorted(host_ips):
+                if ip in connection_failures:
+                    continue
+
+                # 获取网元类型和名称（假设从其他命令或外部输入获取）
+                ne_type, device_name = "-", "-"
+                if ip in data and "show device" in data[ip]:
+                    ne_type, device_name, _, _ = parse_uptime(
+                        data[ip]["show device"])
+
+                # 获取LDP LSP输出
+                ldp_output = data[ip]["show ldp lsp"] if ip in data and "show ldp lsp" in data[ip] else ""
+                lsp_data = parse_ldp_lsp(ldp_output, ne_type, device_name, ip)
+
+                # 处理解析结果
+                start_row = ws.max_row + 1
+                for entry in lsp_data:
+                    total_results += 1
+                    if entry["Result"] == "normal":
+                        normal_results += 1
+
+                    row_data = [
+                        entry["网元类型"],
+                        entry["网元名称"],
+                        entry["网元IP"],
+                        entry["保护条目数"],
+                        entry["链路下一跳"],
+                        entry["Result"]
+                    ]
+                    ws.append(row_data)
+
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+
+                    if entry["Result"] != "normal":
+                        ws.cell(row=ws.max_row, column=6).fill = orange_fill
+
+                # 合并单元格（如果有多行数据）
+                end_row = ws.max_row
+                if start_row < end_row:
+                    for col in range(1, 4):  # 合并网元类型、名称、IP列
+                        ws.merge_cells(
+                            start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+
+            # 计算健康度
+            health_percentage = (
+                normal_results / total_results * 100) if total_results > 0 else 0
+            health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+
 #
+    ws_failure = wb.create_sheet(title="登录失败设备")
+    headers = ["网元IP", "故障原因"]
+    ws_failure.append(headers)
+    for cell in ws_failure[1]:
+        cell.fill = yellow_fill
+        cell.alignment = center_alignment
+        cell.border = thin_border
+        cell.font = header_font
+
+    total_failures = len(connection_failures)
+    total_devices = len(host_ips)
+    success_devices = total_devices - total_failures
+    for ip in sorted(connection_failures.keys()):
+        reason = connection_failures[ip]
+        ws_failure.append([ip, reason])
+        for cell in ws_failure[ws_failure.max_row]:
+            cell.alignment = center_alignment
+            cell.border = thin_border
+        ws_failure.cell(row=ws_failure.max_row,
+                        column=2).fill = orange_fill
+
+    health_percentage = (success_devices / total_devices *
+                         100) if total_devices > 0 else 0
+    health_scores["登录失败设备"] = f"{health_percentage:.0f}%"
+    item_counts["登录失败设备"] = (success_devices, total_devices)
     # Create guide sheet
     ws_guide = wb.create_sheet(title="指南", index=1)
     guide_headers = ["编号", "检查项", "解决方案", "规则", "命令"]
@@ -11313,7 +11212,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         [
             "2",
             "主控盘运行状态检查",
-            "当 15 分钟 CPU 使用率超过 60% 时，需申请清理系统垃圾文件或优化进程；若内存使用率异常，检查内存泄漏或重启设备。",
+            "当 15 分钟 CPU 使用率超过 60% 时，需清理系统垃圾文件或优化进程；若内存使用率异常，检查内存泄漏或重启设备。",
             "15 分钟 CPU 使用率 >= 60%，输出 'error'；CPU 或内存使用率数据无法解析，输出 'error'；否则输出 'normal'。",
             "show device"
         ],
@@ -11389,7 +11288,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         ],
         [
             "13",
-            "BFD会话检查(VC业务BFD检查)",
+            "BFD会话检查(VC业务统计)",
             "若APS组ID不为0且状态为Down，需检查BFD会话配置或网络连通性。",
             "APS组ID !=0 且状态为Down时，输出 'error'；否则输出 'normal'。",
             "show bfd session brief; show bfd configuration pw"
@@ -11405,7 +11304,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "15",
             "OSPF会话进程检查",
             "若SPF执行频率超标，检查网络稳定性；若LSA数异常，检查路由分发；若邻接不足，验证OSPF配置。",
-            "SPF执行频率<20000次/天，LSA总数<1000，外部LSA<500，邻接数≥接口数-2，运行时间正常，否则为'error'。",
+            "SPF执行频率<200000次/天，LSA总数<2000，外部LSA<800，邻接数≥接口数-2，运行时间正常，否则为'error'。",
             "show ospf process"
         ],
         [
@@ -11419,7 +11318,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "17",
             "OSPF邻居状态检查",
             "若缓冲区过小，调整OSPF进程资源配置；若邻居状态异常，检查网络连通性或配置；若存活时间异常，验证计时器设置。",
-            "接收/发送/LSA缓冲区 < 2048字节，未使用包列表 < 10/200，未使用LSA列表 < 20/200，状态 ≠ Full，存活时间 < 40秒，链路状态请求列表 > 0，DR/BDR ≠ 0/0（点对点接口），则为'error'；否则为'normal'。",
+            "接收/发送/LSA缓冲区 < 2048字节，未使用包列表 < 2/200，未使用LSA列表 < 2/200，状态 ≠ Full，存活时间 < 40秒，链路状态请求列表 > 0，DR/BDR ≠ 0/0（点对点接口），则为'error'；否则为'normal'。",
             "show ospf buffers; show ospf neighbor"
         ],
         [
@@ -11433,15 +11332,15 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "19",
             "OSPF 路由表检查",
             "若 Cost 值过高，检查 OSPF 链路成本配置或网络拓扑设计；若 Uptime 过短，检查链路稳定性或路由震荡问题。",
-            "Cost > 2000 或 Uptime < 1小时的 OSPF_IA 路由记录为异常，仅输出异常条目，结果为 'normal'。",
+            "Cost > 4000 或 Uptime < 1小时的 OSPF_IA 路由记录为异常，仅输出异常条目，结果为 'normal'。",
             "show ip routing-table"
         ],
         [
             "20",
             "LDP 会话异常状态检查",
             "若会话状态异常，检查链路或 LDP 配置；若 LSP 未建立，检查路由或标签策略。",
-            "State ≠ OPERATIONAL、Peer IP 无效、LSP ≠ Established 时为 'error'，否则为 'normal'。",
-            "show ldp session; show ldp lsp"
+            "State ≠ OPERATIONAL为 'error'，否则为 'normal'。",
+            "show ldp session"
         ],
 
         [
@@ -11485,7 +11384,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "当发现PTP状态异常时，检查设备时钟信号源、线路连接和BMC优先级配置；若GM偏移统计过大，检查网络延迟和时钟配置同步；确保SyncE与PTP路径一致。",
             "PTP状态须为enable，实际状态为SLAVE；GM时钟标识不为全F；父时钟跳数≤10；GM偏移统计≤50μs；BMC优先级1/2不全为255；BMC时钟等级≤128；SSM控制为on。",
             "show ptp all, show synce"
-        ]
+        ],
+
     ]
     for row_data in guide_content:
         ws_guide.append(row_data)
@@ -11601,10 +11501,84 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     status_cell.alignment = center_alignment
     status_cell.border = thin_border
 
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        # 应用自动列宽
+        autofit_worksheet_columns(ws)
+
+        # 只给子表添加筛选和冻结首行，不给主表（"运维质量评估"）添加
+        if sheet_name != "运维质量评估":
+            # 假设子表的表头都在第1行
+            header_row = 1
+            last_col = ws.max_column
+            last_row = ws.max_row
+
+            # 确保表格有数据才添加筛选
+            if last_row > header_row:
+                # 获取表格范围（从A1到最后一列最后一行）
+                filter_range = f"A{header_row}:{get_column_letter(last_col)}{last_row}"
+                ws.auto_filter.ref = filter_range
+                print(
+                    f"{Fore.GREEN}[INFO] 添加了筛选: {sheet_name}, range: {filter_range}{Style.RESET_ALL}")
+
+            # 添加冻结首行功能
+            # freeze_panes='A2' 表示冻结第1行，从第2行开始可以滚动
+            ws.freeze_panes = 'A2'
+            print(
+                f"{Fore.GREEN}[INFO] 添加冻结首行窗格: {sheet_name}, frozen first row{Style.RESET_ALL}")
+
     # Save workbook
     wb.save(report_file)
     print(
-        f"{Fore.GREEN}[END] QA report generated: {report_file}{Style.RESET_ALL}")
+        f"{Fore.GREEN}[END] 生成 QA 报告: {report_file}{Style.RESET_ALL}")
+
+
+def autofit_worksheet_columns(worksheet):
+    """
+    真正实现Excel中双击列分隔线自适应效果的函数
+    此函数会遍历每个单元格，找出每列中的最长内容，并相应地调整列宽
+    """
+    # 存储每列的最大宽度
+    column_widths = {}
+
+    # 遍历所有单元格
+    for row in worksheet.rows:
+        for cell in row:
+            # 跳过合并单元格
+            if isinstance(cell, MergedCell):
+                continue
+
+            col_idx = cell.column
+            col_letter = get_column_letter(col_idx)
+
+            if cell.value:
+                try:
+                    # 根据单元格内容估算宽度（考虑中文字符和格式）
+                    cell_value = str(cell.value)
+                    # 中文字符宽度通常是英文的2倍
+                    length = 0
+                    for char in cell_value:
+                        # 检查是否为全角字符（如中文、日文等）
+                        if ord(char) > 127:
+                            length += 2
+                        else:
+                            length += 1
+
+                    # 考虑字体加粗会增加宽度
+                    if cell.font and cell.font.bold:
+                        length += len(cell_value) * 0.1
+
+                    # 更新该列的最大宽度
+                    current_width = column_widths.get(col_letter, 0)
+                    column_widths[col_letter] = max(current_width, length)
+                except:
+                    pass
+
+    # 设置列宽
+    for col_letter, width in column_widths.items():
+        # 添加额外空间以确保内容完全显示（类似双击效果）
+        adjusted_width = (width + 4) * 1.1  # 添加一些额外空间和微调系数
+        worksheet.column_dimensions[col_letter].width = adjusted_width
 
 
 def sanitize_string(value):
@@ -11620,6 +11594,7 @@ def _progress_bar(seconds: int, completion_msg: str):
     symbols = cycle(['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'])  # 旋转动画符号
     end_time = time.time() + seconds
 
+    print(f"{Fore.GREEN}✓ {completion_msg}{Style.RESET_ALL}")
     while time.time() < end_time:
         remaining = int(end_time - time.time())
         # 进度百分比计算
@@ -11642,7 +11617,6 @@ def _progress_bar(seconds: int, completion_msg: str):
     # 清除当前行并输出完成消息
     sys.stdout.write(f"\r{' ' * 80}\r")  # 清除整行
     sys.stdout.flush()
-    print(f"{Fore.GREEN}✓ {completion_msg}{Style.RESET_ALL}")
 
 
 # ---------------------------------------------------
@@ -11679,7 +11653,7 @@ if __name__ == '__main__':
   1️⃣7️⃣ 业务LSP检查       - 检查业务LSP状态
   1️⃣8️⃣ 设备告警检查统计   - 统计当前和历史告警
   1️⃣9️⃣ 自动设置设备时间    - 适合无法同步NTP的A设备
-  2️⃣0️⃣ QA巡检             - 质量保证巡检
+  2️⃣0️⃣ QA巡检采集           - 质量保证巡检
   0️⃣  退出系统            - 结束程序
 {Fore.GREEN}默认同时连接20个设备。{Style.RESET_ALL}
 {Fore.CYAN}请输入选项：{Style.RESET_ALL}"""
@@ -12133,10 +12107,10 @@ if __name__ == '__main__':
                     "category": "资源监控"
                 },
                 "13": {
-                    "name": "BFD会话检查(VC业务BFD检查)",
+                    "name": "BFD会话检查(VC业务统计)",
                     "command": "show bfd session brief",
                     "parser": lambda brief_output, config_output, l2vc_output: parse_bfd_sessions(brief_output, config_output, l2vc_output),
-                    "sheet_name": "BFD会话检查(VC业务BFD检查)",
+                    "sheet_name": "BFD会话检查(VC业务统计)",
                     "category": "路由协议健康度"
                 },
                 "14": {
@@ -12183,10 +12157,10 @@ if __name__ == '__main__':
                     "category": "路由协议健康度"
                 },
                 "20": {
-                    "name": "LDP 异常会话状态检查",
-                    "command": ["show ldp session", "show ldp lsp"],
+                    "name": "LDP 会话状态检查",
+                    "command": ["show ldp session"],
                     "parser": parse_ldp_session_status,
-                    "sheet_name": "LDP 异常会话状态检查",
+                    "sheet_name": "LDP 会话状态检查",
                     "category": "路由协议健康度"
                 },
                 "21": {
@@ -12230,7 +12204,13 @@ if __name__ == '__main__':
                     "parser": lambda ptp_output, synce_output, ne_type, ne_name, ne_ip: parse_ptp_clock_status(ptp_output, synce_output, ne_type, ne_name, ne_ip),
                     "sheet_name": "PTP时钟检查",
                     "category": "系统运行状态"
-                },
+                }, "27": {
+                    "name": "邻接站点检查",
+                    "command": ["show ldp lsp"],
+                    "parser": parse_ldp_lsp,
+                    "sheet_name": "邻接站点检查",
+                    "category": "冗余与容灾"
+                }
 
             }
 
@@ -12323,7 +12303,7 @@ if __name__ == '__main__':
                     commands.extend(["show cloc", "show ntp-service"])
                 if any(item['name'] == "硬盘资源占用分析" for item in selected_items):
                     commands.append("show flash-usage")
-                if any(item['name'] == "BFD会话检查(VC业务BFD检查)" for item in selected_items):
+                if any(item['name'] == "BFD会话检查(VC业务统计)" for item in selected_items):
                     commands.append("show bfd session brief")
                     commands.append("show bfd configuration pw")
                     commands.append("show mpls l2vc brief")
@@ -12341,8 +12321,8 @@ if __name__ == '__main__':
                     commands.extend(["show lag", "show lacp"])
                 if any(item['name'] == "OSPF 路由表检查" for item in selected_items):
                     commands.extend(["show ip routing-table"])
-                if any(item['name'] == "LDP 异常会话状态检查" for item in selected_items):
-                    commands.extend(["show ldp session", "show ldp lsp"])
+                if any(item['name'] == "LDP 会话状态检查" for item in selected_items):
+                    commands.extend(["show ldp session"])
                 if any(item['name'] == "Loopback31地址唯一性检查" for item in selected_items):
                     commands.extend(["show interface loopback 31"])
                 if any(item['name'] == "Loopback1023地址唯一性检查" for item in selected_items):
@@ -12367,13 +12347,13 @@ if __name__ == '__main__':
                 print(
                     f"{Fore.YELLOW}[DEBUG] 用户选择巡检项: {', '.join([item['name'] for item in selected_items])}{Style.RESET_ALL}")
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 采集的命令: {commands}{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 使用以下命令进行采集: {commands}{Style.RESET_ALL}")
 
                 # Proceed with file inputs and report generation
                 raw_file = getinput("qa_raw.txt", "原始数据文件（默认：qa_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
-                _progress_bar(9, "🚀 设备会话就绪")
+                _progress_bar(9, "🚀 会话就绪")
                 fish_multiple_cmds(host_file, raw_file, commands)
                 _progress_bar(5, "🚀 清洗就绪")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
