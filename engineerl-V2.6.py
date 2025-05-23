@@ -3,9 +3,6 @@ STN-A设备巡检系统 v2.6
 使用前需手动安装模块：pip install openpyxl pytz paramiko tqdm colorama pyinstaller
 更新说明：
 
-新增功能
-    冗余与安全:
-        站点邻接网元检查
 - 修复若干BUG
         
 作者：杨茂森
@@ -5484,23 +5481,23 @@ def parse_ldp_lsp(ldp_output, ne_type, ne_name, ne_ip):
             "网元类型": ne_type,
             "网元名称": ne_name,
             "网元IP": ne_ip,
-            "保护条目数": 0,
-            "链路下一跳": "-",
+            "邻接网元数": 0,
+            "邻接下一跳地址": "-",
             "Result": "error"
         }]
 
-    # 计算保护条目数和链路下一跳
+    # 计算邻接网元数和邻接下一跳地址
     protection_count = len(next_hops)
     next_hop_str = ", ".join(sorted(next_hops))  # 将下一跳地址按顺序拼接
-    result = "normal" if protection_count >= 2 else "error"
+    result = "normal" if protection_count >= 2 else "normal"
 
     # 生成结果行
     row = {
         "网元类型": ne_type,
         "网元名称": ne_name,
         "网元IP": ne_ip,
-        "保护条目数": protection_count,
-        "链路下一跳": next_hop_str,
+        "邻接网元数": protection_count,
+        "邻接下一跳地址": next_hop_str,
         "Result": result
     }
     result_data.append(row)
@@ -6338,7 +6335,7 @@ def parse_ospf_routing_table(output):
 
             # 规则检查
             if cost_val > 4000:
-                remarks.append(f"Cost值过高（{cost_val} > 4000），可能导致次优路径选择或环路")
+                remarks.append(f"Cost值过高（{cost_val} > 6000），可能导致次优路径选择或环路")
             if uptime_secs < 3600:  # 小于1小时
                 uptime_str = str(timedelta(seconds=uptime_secs))
                 remarks.append(f"Uptime < 1小时（{uptime_str}），区域内OSPF有刷新")
@@ -6370,9 +6367,9 @@ def parse_ldp_session_status(output):
     lines = output.split('\n')
     session_section = False
 
-    # 正则表达式匹配会话条目
+    # 正则表达式匹配会话条目，vc字段可选
     session_pattern = re.compile(
-        r'(\S+)\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+(?:\s+\S+)*?)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)'
+        r'(\S+)\s+(vc\s+)?(\d+\.\d+\.\d+\.\d+)\s+(\S+(?:\s+\S+)*?)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)'
     )
 
     for line in lines:
@@ -6386,11 +6383,12 @@ def parse_ldp_session_status(output):
         # 尝试匹配会话行
         match = session_pattern.search(line)
         if match:
-            peer_type, vc_type, peer_ip, interface, role, state, keepalive, uptime = match.groups()
-
-            # 处理对端类型
-            peer_type_full = f"{peer_type} {vc_type}".strip(
-            ) if vc_type != "vc" else peer_type
+            peer_type, vc, peer_ip, interface, role, state, keepalive, uptime = match.groups()
+            # 动态确定对端类型
+            if vc:
+                peer_type_full = f"{peer_type} {vc.strip()}"
+            else:
+                peer_type_full = peer_type
 
             # 检查会话状态，设置 Result
             result = "normal" if state == "OPERATIONAL" else "error"
@@ -6416,7 +6414,6 @@ def parse_ldp_session_status(output):
         sessions = [{"对端IP": "无会话"}]
 
     return sessions
-
 
 def parse_ospf_buffers(output):
     buffers = {}
@@ -6550,12 +6547,28 @@ def check_ospf_neighbor(neighbor, buffers):
         if lsa_buf < 2048:
             remarks.append("LSA缓冲区过小")
             result = "error"
-        if packet_unused < 2:
-            remarks.append("未使用包列表过少")
-            result = "normal"
-        if lsa_unused < 2:
-            remarks.append("未使用LSA列表过少")
-            result = "normal"
+        # if packet_unused < 2:
+        #     remarks.append("未使用包列表过少")
+        #     result = "normal"
+        # if lsa_unused < 2:
+        #     remarks.append("未使用LSA列表过少")
+        #     result = "normal"
+
+    # 获取接口名称（默认值设为小写，避免大小写问题）
+    interface_name = neighbor.get('interface', '-').lower()
+
+    # 定义需要匹配的接口前缀列表（不区分大小写）
+    allowed_interface_prefixes = [
+        'gigabitethernet',
+        'xgigabitethernet',
+        '50ge'  # 覆盖 50GE/50ge/50Ge 等变体
+    ]
+    # 检查接口是否以允许的前缀开头
+    # if any(interface_name.startswith(prefix) for prefix in allowed_interface_prefixes):
+    #     # 当接口匹配时，检查 DR/BDR 是否为非零地址
+    #     if neighbor.get('dr', '0.0.0.0') != '0.0.0.0' or neighbor.get('bdr', '0.0.0.0') != '0.0.0.0':
+    #         remarks.append("DR/BDR路由非点到点模式")
+    #         result = "normal"
     state = neighbor.get('state', '-')
     if state != 'Full' and state != '-':
         remarks.append("邻居状态非Full")
@@ -6566,22 +6579,6 @@ def check_ospf_neighbor(neighbor, buffers):
     # 增加网络类型判断（需要从设备获取实际网络类型参数）
     network_type = neighbor.get('network_type', 'broadcast')  # 默认广播网络
 
-    # 定义需要匹配的接口前缀列表（不区分大小写）
-    allowed_interface_prefixes = [
-        'gigabitethernet',
-        'xgigabitethernet',
-        '50ge'  # 覆盖 50GE/50ge/50Ge 等变体
-    ]
-
-    # 获取接口名称（默认值设为小写，避免大小写问题）
-    interface_name = neighbor.get('interface', '-').lower()
-
-    # 检查接口是否以允许的前缀开头
-    if any(interface_name.startswith(prefix) for prefix in allowed_interface_prefixes):
-        # 当接口匹配时，检查 DR/BDR 是否为非零地址
-        if neighbor.get('dr', '0.0.0.0') != '0.0.0.0' or neighbor.get('bdr', '0.0.0.0') != '0.0.0.0':
-            remarks.append("DR/BDR路由非点到点模式")
-            result = "normal"
     return result, "; ".join(remarks) if remarks else "-"
 
 
@@ -7054,12 +7051,12 @@ def check_ospf_process(session, output):
         adjacencies = int(adjacencies)
         if interfaces > 2:
             if adjacencies < 2:  # 修改为检查邻接数 < 2
-                remarks.append("⚠️ 邻接数少于2")
+                remarks.append("⚠️ 邻接数少于2(单链站点)")
                 result = "error"
                 if adjacencies == 0:
                     remarks.append("❗ 无邻接，可能OSPF未激活或认证错误")
-            elif adjacencies < (interfaces - 2):  # 保留原有逻辑作为次要检查
-                remarks.append("⚠️ 邻接数少于预期(邻接数≥接口数-2)")
+            # elif adjacencies < (interfaces - 2):  # 保留原有逻辑作为次要检查
+            #     remarks.append("⚠️ 邻接数少于预期(邻接数≥接口数-2)")
     except ValueError:
         remarks.append("⚠️ 邻接或接口数解析失败")
         pass
@@ -7888,14 +7885,14 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 parts = line.split(",", 1)
                 interface_data[current_interface]["wavelength"] = parts[0].split(":", 1)[
                     1].strip()
-                if "Transmission Distance:" in parts[1]:
+                if len(parts) > 1 and "Transmission Distance:" in parts[1]:
                     interface_data[current_interface]["distance"] = parts[1].split(":", 1)[
                         1].strip()
             elif "Rx Power:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["rx_power"] = parts[0].split(":", 1)[
                     1].strip()
-                if "Warning range:" in parts[1]:
+                if len(parts) > 1 and "Warning range:" in parts[1]:
                     warning_range = parts[1].split(":", 1)[1].strip()
                     # Extract alarm range if present
                     if "Alarm range:" in warning_range:
@@ -7911,7 +7908,7 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 parts = line.split(",", 1)
                 interface_data[current_interface]["tx_power"] = parts[0].split(":", 1)[
                     1].strip()
-                if "Warning range:" in parts[1]:
+                if len(parts) > 1 and "Warning range:" in parts[1]:
                     warning_range = parts[1].split(":", 1)[1].strip()
                     # Extract alarm range if present
                     if "Alarm range:" in warning_range:
@@ -7927,7 +7924,7 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 parts = line.split(",", 1)
                 interface_data[current_interface]["bias"] = parts[0].split(":", 1)[
                     1].strip()
-                if "Warning range:" in parts[1]:
+                if len(parts) > 1 and "Warning range:" in parts[1]:
                     warning_range = parts[1].split(":", 1)[1].strip()
                     # Extract alarm range if present
                     if "Alarm range:" in warning_range:
@@ -7943,7 +7940,7 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 parts = line.split(",", 1)
                 interface_data[current_interface]["voltage"] = parts[0].split(":", 1)[
                     1].strip()
-                if "Warning range:" in parts[1]:
+                if len(parts) > 1 and "Warning range:" in parts[1]:
                     warning_range = parts[1].split(":", 1)[1].strip()
                     # Extract alarm range if present
                     if "Alarm range:" in warning_range:
@@ -7959,7 +7956,7 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 parts = line.split(",", 1)
                 interface_data[current_interface]["temperature"] = parts[0].split(":", 1)[
                     1].strip()
-                if "Warning range:" in parts[1]:
+                if len(parts) > 1 and "Warning range:" in parts[1]:
                     warning_range = parts[1].split(":", 1)[1].strip()
                     # Extract alarm range if present
                     if "Alarm range:" in warning_range:
@@ -7975,21 +7972,21 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
                 parts = line.split(",", 1)
                 interface_data[current_interface]["port_bw"] = parts[0].split(":", 1)[
                     1].strip()
-                if "Transceiver max BW:" in parts[1]:
+                if len(parts) > 1 and "Transceiver max BW:" in parts[1]:
                     interface_data[current_interface]["transceiver_bw"] = parts[1].split(":", 1)[
                         1].strip()
             elif "Input rate:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["input_rate"] = parts[0].split(":", 1)[
                     1].split(" bits")[0].strip()
-                if "bandwidth utilization:" in parts[1]:
+                if len(parts) > 1 and "bandwidth utilization:" in parts[1]:
                     interface_data[current_interface]["input_util"] = parts[1].split(":", 1)[
                         1].strip()
             elif "Output rate:" in line:
                 parts = line.split(",", 1)
                 interface_data[current_interface]["output_rate"] = parts[0].split(":", 1)[
                     1].split(" bits")[0].strip()
-                if "bandwidth utilization:" in parts[1]:
+                if len(parts) > 1 and "bandwidth utilization:" in parts[1]:
                     interface_data[current_interface]["output_util"] = parts[1].split(":", 1)[
                         1].strip()
             elif "CRC :" in line:
@@ -8055,18 +8052,20 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
         # Check Rx Power
         try:
             rx_power = float(data["rx_power"].replace("dBm", ""))
-            rx_min, rx_max = extract_range_values(
-                rx_alarm_range if rx_alarm_range != "-" else rx_range)
 
-            if rx_power == -40:
+            if rx_power == -40.0:
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Rx光功率为-40dBm (收无光)，状态为normal{Style.RESET_ALL}")
-            elif rx_min is not None and rx_max is not None and (rx_power < rx_min or rx_power > rx_max):
-                result = "error"
-                error_reasons.append(
-                    f"Rx光功率超出范围: {rx_power}dBm 范围: {rx_min}~{rx_max}dBm")
-                print(
-                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Rx光功率异常: {rx_power}dBm 范围: {rx_min}~{rx_max}dBm{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Rx光功率为-40.0dBm (收无光)，跳过范围判断{Style.RESET_ALL}")
+            else:
+                rx_min, rx_max = extract_range_values(
+                    rx_alarm_range if rx_alarm_range != "-" else rx_range)
+
+                if rx_min is not None and rx_max is not None and (rx_power < rx_min or rx_power > rx_max):
+                    result = "error"
+                    error_reasons.append(
+                        f"Rx光功率超出范围: {rx_power}dBm 范围: {rx_min}~{rx_max}dBm")
+                    print(
+                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Rx光功率异常: {rx_power}dBm 范围: {rx_min}~{rx_max}dBm{Style.RESET_ALL}")
         except (ValueError, TypeError):
             print(
                 f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {interface} Rx光功率解析失败: {data['rx_power']}{Style.RESET_ALL}")
@@ -9086,7 +9085,7 @@ def create_progress_bar(percentage):
 
 
 def generate_qa_report(raw_file, report_file, host_file, selected_items):
-    """Generate QA inspection report with enhanced summary table visualization"""
+    """Generate QA report with enhanced summary table visualization"""
     print(
         f"{Fore.CYAN}[START] Starting QA report generation, source: {raw_file}, target: {report_file}{Style.RESET_ALL}")
 
@@ -9095,7 +9094,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     ws_summary = wb.active
     ws_summary.title = "运维质量评估"
 
-    # Define styles
+    # Define styles (保持原有样式定义不变)
     yellow_fill = PatternFill(start_color='FFFF00',
                               end_color='FFFF00', fill_type='solid')
     orange_fill = PatternFill(start_color='FFA500',
@@ -9118,15 +9117,15 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     title_font = Font(bold=True, size=14)
     hyperlink_font = Font(color="0000FF", underline="single", size=11)
 
-    # Set column widths
-    ws_summary.column_dimensions['A'].width = 20  # Category
-    ws_summary.column_dimensions['B'].width = 30  # Inspection Item
-    ws_summary.column_dimensions['C'].width = 12  # Health %
-    ws_summary.column_dimensions['D'].width = 20  # Progress Bar
-    ws_summary.column_dimensions['E'].width = 15  # Device Count
-    ws_summary.column_dimensions['F'].width = 15  # Status
+    # Set column widths 
+    ws_summary.column_dimensions['A'].width = 20
+    ws_summary.column_dimensions['B'].width = 30
+    ws_summary.column_dimensions['C'].width = 12
+    ws_summary.column_dimensions['D'].width = 20
+    ws_summary.column_dimensions['E'].width = 15
+    ws_summary.column_dimensions['F'].width = 15
 
-    # Title row
+    # Title and header rows 
     ws_summary.merge_cells('A1:F1')
     ws_summary['A1'] = "STN-A设备运维质量评估报告"
     ws_summary['A1'].font = title_font
@@ -9134,24 +9133,23 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     ws_summary['A1'].fill = yellow_fill
     ws_summary['A1'].border = thin_border
 
-    # Header row
     header_row = 2
-    headers = ["检查分类", "巡检项目", "健康度", "直观展示", "设备计数", "健康状态"]
+    headers = ["检查分类", "巡检项目", "健康度", "直观展示", "条目计数", "健康状态"]
     for col, value in enumerate(headers, 1):
         cell = ws_summary.cell(row=header_row, column=col, value=value)
         cell.fill = yellow_fill
         cell.font = header_font
         cell.alignment = center_alignment
         cell.border = thin_border
-    # Read host file
+
+    # Read host file 
     with open(host_file, "r", encoding='gbk', errors='ignore') as f:
         reader = csv.reader(f)
-        # next(reader)
         host_ips = [row[0].strip() for row in reader]
         print(
             f"{Fore.GREEN}[DEBUG] Loaded {len(host_ips)} devices{Style.RESET_ALL}")
 
-    # Read raw data
+    # Read raw data 
     data = {}
     with open(raw_file, "r", encoding='utf-8') as f:
         csv.field_size_limit(sys.maxsize)
@@ -9168,7 +9166,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] Loaded data for {ip}, cmd: {cmd}{Style.RESET_ALL}")
 
-    # Read connection failures
+    # Read connection failures 
     connection_failures = {}
     try:
         with open("failure_ips.tmp", "r", encoding='utf-8') as f:
@@ -9183,7 +9181,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         print(
             f"{Fore.YELLOW}[DEBUG] No failure_ips.tmp found{Style.RESET_ALL}")
 
-    # Organize inspection items by category
+    # Organize inspection items by category 
     categories = {
         "设备基础状态": [item for item in selected_items if item["category"] == "设备基础状态"],
         "硬件可靠性": [item for item in selected_items if item["category"] == "硬件可靠性"],
@@ -9198,7 +9196,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     health_scores = {}
     item_counts = {}
 
-    # Process Loopback addresses
+    # Process Loopback addresses 
     loopback31_addresses = {}
     loopback1023_addresses = {}
     for ip in host_ips:
@@ -9225,6 +9223,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         sheet_name = item['sheet_name']
         ws = wb.create_sheet(title=sheet_name)
         print(f"{Fore.GREEN}[DEBUG] 创建子表: {sheet_name}{Style.RESET_ALL}")
+
+        # 初始化计数器
         total_results = 0
         normal_results = 0
 
@@ -9267,6 +9267,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[sheet_name] = f"{health_percentage:.0f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "主控盘运行状态":
             headers = ["网元类型", "网元名称", "网元IP", "CPU使用率",
@@ -9310,7 +9311,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 # 计算健康度
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
-                health_scores[sheet_name] = f"{health_percentage:.0f}%"
+                health_scores[sheet_name] = f"{health_percentage:.0f}%" 
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "协议报文处理状态":
             headers = ["网元类型", "网元名称", "网元IP", "协议类型",
@@ -9369,6 +9371,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "真实版本信息":
             headers = ["网元类型", "网元名称", "网元IP", "组件类型", "版本标识",
@@ -9440,6 +9443,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "风扇转速及温度状态":
             headers = ["网元类型", "网元名称", "网元IP", "风扇状态", "风扇速度",
@@ -9522,6 +9526,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "系统与硬件版本状态":
             headers = ["网元类型", "网元名称", "设备MAC", "网元IP", "系统版本", "运行时间", "对象ID", "槽位", "板卡名称",
@@ -9614,6 +9619,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                                          100) if total_results > 0 else 0
                     health_scores[item['sheet_name']
                                   ] = f"{health_percentage:.0f}%"
+                    item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "光模块信息检查":
             headers = [
@@ -9711,6 +9717,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "电源状态":
             headers = ["网元类型", "网元名称", "网元IP", "槽位", "当前电压", "电压比", "Result"]
@@ -9778,6 +9785,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "主备主控软件版本一致性检查":
             headers = ["网元类型", "网元名称", "网元IP", "主用版本", "备用版本", "Result"]
@@ -9820,6 +9828,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "板卡CPU内存使用率":
             headers = [
@@ -9900,6 +9909,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
             print(
                 f"{Fore.YELLOW}[DEBUG] 子表 {sheet_name} 健康度: {normal_results}/{total_results} = {health_percentage:.0f}%{Style.RESET_ALL}")
 
@@ -9959,6 +9969,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "硬盘资源占用分析":
             headers = ["网元类型", "网元名称", "网元IP", "总容量",
@@ -10006,6 +10017,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+                item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "BFD会话检查(VC业务统计)":
             headers = [
@@ -10072,6 +10084,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "配置校验状态":
             headers = ["网元类型", "网元名称", "网元IP", "配置校验功能状态",
@@ -10115,6 +10128,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "OSPF进程状态检查":
             headers = ["网元类型", "网元名称", "网元IP", "进程ID", "路由ID", "运行时间", "绑定VRF", "RFC兼容性",
@@ -10202,6 +10216,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "IPFRR-LSP状态检查":
             headers = ["网元类型", "网元名称", "网元IP", "目标LSR ID", "类型", "描述", "状态", "入标签",
@@ -10307,6 +10322,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "OSPF邻居状态检查":
             headers = [
@@ -10395,6 +10411,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
             print(
                 f"[DEBUG] OSPF health for {item['sheet_name']}: {normal_results}/{total_results} = {health_percentage}%")
 
@@ -10455,6 +10472,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "OSPF 路由表检查":
             headers = [
@@ -10519,6 +10537,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "LDP 会话状态检查":
             headers = [
@@ -10603,6 +10622,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "Loopback31地址唯一性检查":
             headers = ["网元类型", "网元名称", "网元IP", "Loopback31地址", "Result"]
@@ -10650,6 +10670,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[sheet_name] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "Loopback1023地址唯一性检查":
             headers = ["网元类型", "网元名称", "网元IP", "Loopback1023地址", "Result"]
@@ -10697,6 +10718,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[sheet_name] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "SNMP配置检查":
             headers = [
@@ -10782,6 +10804,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "设备账户检查":
             headers = [
@@ -10862,6 +10885,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "专网业务分析":
             headers = ["网元类型", "网元名称", "网元IP", "类型", "VSI_ID", "VSI名称", "MTU",
@@ -10946,6 +10970,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "PTP时钟检查":
             headers = ["网元类型", "网元名称", "网元IP", "时钟标识", "PTP状态", "时钟模式", "域值",
@@ -11104,33 +11129,42 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
 
         elif item['name'] == "站点邻接网元检查":
-            headers = ["网元类型", "网元名称", "网元IP", "邻接条目数", "下一跳邻接地址", "Result"]
+            headers = ["网元类型", "网元名称", "网元IP", "邻接网元数", "邻接下一跳地址", "Result"]
             ws.append(headers)
             for cell in ws[1]:
                 cell.fill = yellow_fill
                 cell.alignment = center_alignment
                 cell.border = thin_border
 
-            total_results = 0
-            normal_results = 0
             for ip in sorted(host_ips):
                 if ip in connection_failures:
                     continue
 
-                # 获取网元类型和名称（假设从其他命令或外部输入获取）
+                # 修复1：获取网元类型和名称的正确方式
                 ne_type, device_name = "-", "-"
                 if ip in data and "show device" in data[ip]:
-                    ne_type, device_name, _, _ = parse_uptime(
-                        data[ip]["show device"])
+                    try:
+                        # 修复：正确的解包方式，根据parse_uptime函数的返回值调整
+                        device_info = parse_uptime(data[ip]["show device"])
+                        if isinstance(device_info, tuple) and len(device_info) >= 2:
+                            ne_type = device_info[0] if device_info[0] else "-"
+                            device_name = device_info[1] if device_info[1] else "-"
+                    except Exception as e:
+                        print(
+                            f"{Fore.YELLOW}[WARNING] Failed to parse device info for {ip}: {e}{Style.RESET_ALL}")
 
-                # 获取LDP LSP输出
-                ldp_output = data[ip]["show ldp lsp"] if ip in data and "show ldp lsp" in data[ip] else ""
+                # 修复2：获取LDP LSP输出
+                ldp_output = data.get(ip, {}).get("show ldp lsp", "")
+                if not ldp_output:
+                    print(
+                        f"{Fore.YELLOW}[WARNING] No LDP LSP data for {ip}{Style.RESET_ALL}")
+
                 lsp_data = parse_ldp_lsp(ldp_output, ne_type, device_name, ip)
 
                 # 处理解析结果
-                start_row = ws.max_row + 1
                 for entry in lsp_data:
                     total_results += 1
                     if entry["Result"] == "normal":
@@ -11140,12 +11174,13 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         entry["网元类型"],
                         entry["网元名称"],
                         entry["网元IP"],
-                        entry["保护条目数"],
-                        entry["链路下一跳"],
+                        entry["邻接网元数"],
+                        entry["邻接下一跳地址"],
                         entry["Result"]
                     ]
                     ws.append(row_data)
 
+                    # 应用样式
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11153,17 +11188,12 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     if entry["Result"] != "normal":
                         ws.cell(row=ws.max_row, column=6).fill = orange_fill
 
-                # 合并单元格（如果有多行数据）
-                end_row = ws.max_row
-                if start_row < end_row:
-                    for col in range(1, 4):  # 合并网元类型、名称、IP列
-                        ws.merge_cells(
-                            start_row=start_row, start_column=col, end_row=end_row, end_column=col)
-
             # 计算健康度
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
+
 
 #
     ws_failure = wb.create_sheet(title="登录失败设备")
@@ -11395,68 +11425,68 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     for col_idx, width in enumerate([8, 25, 45, 35, 20], 1):
         ws_guide.column_dimensions[get_column_letter(col_idx)].width = width
 
-    # Populate summary table with enhanced visualization
-    row = header_row + 1
+    row = header_row + 1  # 从标题行下一行开始
     for category, items in categories.items():
-        if not items:
+        if not items:  # 跳过空分类
             continue
+        # 合并分类单元格
         merge_end_row = row + len(items) - 1
         ws_summary.merge_cells(f'A{row}:A{merge_end_row}')
+        
+        # 写入分类名称并设置样式
         category_cell = ws_summary.cell(row=row, column=1, value=category)
-        category_cell.fill = yellow_fill
-        category_cell.alignment = center_alignment
-        category_cell.border = thin_border
-        category_cell.font = header_font
-
+        category_cell.fill = yellow_fill  # 黄色背景
+        category_cell.alignment = center_alignment  # 居中
+        category_cell.border = thin_border  # 细边框
+        category_cell.font = header_font  # 标题字体
+    
+        # 遍历每个检查项
         for item in items:
             sheet_name = item['sheet_name']
             health_percent = health_scores.get(sheet_name, "0%")
+            print(f"分类: {category}, 项目: {item['name']}, 健康度: {health_percent}")
             normal_count, total_count = item_counts.get(sheet_name, (0, 0))
-
-            # Inspection item with hyperlink
+    
+            # 写入检查项名称（带超链接）
             cell = ws_summary.cell(row=row, column=2, value=item['name'])
-            cell.hyperlink = f"#'{sheet_name}'!A1"
-            cell.font = hyperlink_font
+            cell.hyperlink = f"#'{sheet_name}'!A1"  # 添加工作表超链接
+            cell.font = hyperlink_font  # 超链接字体
             cell.alignment = center_alignment
             cell.border = thin_border
-
-            # Health percentage
-            ws_summary.cell(row=row, column=3,
-                            value=health_percent).alignment = center_alignment
+    
+            # 健康度百分比
+            ws_summary.cell(row=row, column=3, value=health_percent).alignment = center_alignment
             ws_summary.cell(row=row, column=3).border = thin_border
-
-            # Progress bar
+    
+            # 生成进度条
             percent_value_str = health_percent.rstrip('%')
             percent_value = int(float(percent_value_str))
-            progress_bar = create_progress_bar(percent_value)
-            ws_summary.cell(row=row, column=4,
-                            value=progress_bar).alignment = left_alignment
+            progress_bar = create_progress_bar(percent_value)  # 创建文本进度条
+            ws_summary.cell(row=row, column=4, value=progress_bar).alignment = left_alignment
             ws_summary.cell(row=row, column=4).border = thin_border
-
-            # Device count
-            ws_summary.cell(
-                row=row, column=5, value=f"{normal_count}/{total_count}").alignment = center_alignment
+    
+            # 设备数量统计
+            ws_summary.cell(row=row, column=5, value=f"{normal_count}/{total_count}").alignment = center_alignment
             ws_summary.cell(row=row, column=5).border = thin_border
-
-            # Status indicator
+    
+            # 状态指示灯
             status_cell = ws_summary.cell(row=row, column=6)
             if percent_value >= 90:
                 status_cell.value = "优"
-                status_cell.fill = green_fill
+                status_cell.fill = green_fill  # 绿色背景
             elif percent_value >= 70:
                 status_cell.value = "良"
-                status_cell.fill = light_green_fill
+                status_cell.fill = light_green_fill  # 浅绿色
             elif percent_value >= 50:
                 status_cell.value = "中"
-                status_cell.fill = yellow_amber_fill
+                status_cell.fill = yellow_amber_fill  # 琥珀色
             else:
                 status_cell.value = "差"
-                status_cell.fill = light_red_fill
+                status_cell.fill = light_red_fill  # 浅红色
             status_cell.alignment = center_alignment
             status_cell.border = thin_border
-
-            row += 1
-
+    
+            row += 1  # 移动到下一行
     # Add connection status row
     ws_summary.cell(row=row, column=1, value="设备网管状态").fill = yellow_fill
     ws_summary.cell(row=row, column=1).alignment = center_alignment
@@ -12204,11 +12234,12 @@ if __name__ == '__main__':
                     "parser": lambda ptp_output, synce_output, ne_type, ne_name, ne_ip: parse_ptp_clock_status(ptp_output, synce_output, ne_type, ne_name, ne_ip),
                     "sheet_name": "PTP时钟检查",
                     "category": "系统运行状态"
-                }, "27": {
-                    "name": "邻接站点检查",
+                },
+                "27": {
+                    "name": "站点邻接网元检查",
                     "command": ["show ldp lsp"],
                     "parser": parse_ldp_lsp,
-                    "sheet_name": "邻接站点检查",
+                    "sheet_name": "站点邻接网元检查",
                     "category": "冗余与容灾"
                 }
 
@@ -12235,7 +12266,7 @@ if __name__ == '__main__':
             print(f"\n{Fore.YELLOW}-----{Style.RESET_ALL}")
             print("0. 返回主菜单")
             print("00. 执行全量巡检")
-            print("000. QA文件清洗（仅清洗已有qa_raw.txt数据）")
+            print("000. QA文件清洗（仅清洗已有qa_wash_raw.txt数据）")
 
             # Get user selection
             selection = input(f"{Fore.CYAN}请输入选项：{Style.RESET_ALL}")
@@ -12245,7 +12276,7 @@ if __name__ == '__main__':
                 # QA文件清洗模式
                 print(
                     f"{Fore.GREEN}[INFO] 触发QA文件清洗模式，仅处理已有数据{Style.RESET_ALL}")
-                raw_file = getinput("qa_raw.txt", "原始数据文件（默认：qa_raw.txt）：")
+                raw_file = getinput("qa_wash_raw.txt", "原始数据文件（默认：qa_wash_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
@@ -12337,6 +12368,8 @@ if __name__ == '__main__':
                     commands.extend(["show vsi brief"])
                 if any(item['name'] == "PTP时钟检查" for item in selected_items):
                     commands.extend(["show ptp all", "show synce"])
+                if any(item['name'] == "站点邻接网元检查" for item in selected_items):
+                    commands.extend(["show ldp lsp"])
 
                 commands.append("show device")
 
@@ -12355,6 +12388,26 @@ if __name__ == '__main__':
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
                 _progress_bar(9, "🚀 会话就绪")
                 fish_multiple_cmds(host_file, raw_file, commands)
+
+                # 添加复制文件的功能
+                import shutil
+                import os
+
+                # 检查原始文件是否存在
+                if os.path.exists(raw_file):
+                    try:
+                        # 生成备份文件名
+                        backup_file = "qa_wash_raw.txt"
+                        shutil.copy2(raw_file, backup_file)
+                        print(
+                            f"{Fore.GREEN}[INFO] 已成功复制 {raw_file} 到 {backup_file}{Style.RESET_ALL}")
+                    except Exception as e:
+                        print(
+                            f"{Fore.RED}[ERROR] 复制文件失败: {str(e)}{Style.RESET_ALL}")
+                else:
+                    print(
+                        f"{Fore.RED}[WARNING] 原始文件 {raw_file} 不存在，跳过复制操作{Style.RESET_ALL}")
+
                 _progress_bar(5, "🚀 清洗就绪")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
                 generate_qa_report(raw_file, report_file,
