@@ -1,13 +1,13 @@
 """
-STN-A设备巡检系统 v2.6
+STN-A设备巡检系统 v2.7
 使用前需手动安装模块：pip install openpyxl pytz paramiko tqdm colorama pyinstaller
 更新说明：
-
+- 增强功能BFD会话检查(VC业务统计)
 - 修复若干BUG
         
 作者：杨茂森
 
-最后更新：2025-5-16
+最后更新：2025-5-30
 """
 # 导入必要的库
 from openpyxl.styles import PatternFill, Alignment, Border, Side
@@ -6415,6 +6415,7 @@ def parse_ldp_session_status(output):
 
     return sessions
 
+
 def parse_ospf_buffers(output):
     buffers = {}
     lines = output.split('\n')
@@ -6564,11 +6565,11 @@ def check_ospf_neighbor(neighbor, buffers):
         '50ge'  # 覆盖 50GE/50ge/50Ge 等变体
     ]
     # 检查接口是否以允许的前缀开头
-    # if any(interface_name.startswith(prefix) for prefix in allowed_interface_prefixes):
-    #     # 当接口匹配时，检查 DR/BDR 是否为非零地址
-    #     if neighbor.get('dr', '0.0.0.0') != '0.0.0.0' or neighbor.get('bdr', '0.0.0.0') != '0.0.0.0':
-    #         remarks.append("DR/BDR路由非点到点模式")
-    #         result = "normal"
+    if any(interface_name.startswith(prefix) for prefix in allowed_interface_prefixes):
+        # 当接口匹配时，检查 DR/BDR 是否为非零地址
+        if neighbor.get('dr', '0.0.0.0') != '0.0.0.0' or neighbor.get('bdr', '0.0.0.0') != '0.0.0.0':
+            remarks.append("DR/BDR路由非点到点模式")
+            result = "normal"
     state = neighbor.get('state', '-')
     if state != 'Full' and state != '-':
         remarks.append("邻居状态非Full")
@@ -7250,7 +7251,7 @@ def check_mpls_lsp(lsp):
     return result, "; ".join(suggestions) if suggestions else "-"
 
 
-def parse_bfd_sessions(brief_output, config_output, l2vc_output):
+def parse_bfd_sessions(brief_output, config_output, l2vc_output, ldp_detail_output=""):
     # Parse config_output to build config_data_by_local_id
     config_data_by_local_id = {}
     config_lines = config_output.split('\n')
@@ -7338,8 +7339,13 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output):
                     'interface': interface,
                     'vc_type': vc_type
                 }
+    
+    # Parse LDP L2VC detail information
+    ldp_data_by_vcid = parse_ldp_l2vc_detail(ldp_detail_output)
+    
     # 调试：打印 l2vc_data_by_vcid 以验证所有 VCID 是否被捕获
-    print(f"Debug: l2vc_data_by_vcid = {l2vc_data_by_vcid}")
+    # print(f"Debug: l2vc_data_by_vcid = {l2vc_data_by_vcid}")
+    # print(f"Debug: ldp_data_by_vcid = {ldp_data_by_vcid}")
 
     # Parse brief_output to get session list
     sessions = []
@@ -7397,6 +7403,21 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output):
                 vc_state = l2vc.get('vc_state', '-')
                 interface = l2vc.get('interface', '-')
                 vc_type = l2vc.get('vc_type', '-')
+                
+                # Get LDP L2VC detail information
+                ldp_detail = ldp_data_by_vcid.get(vcid, {})
+                local_mtu = ldp_detail.get('local_mtu', '-')
+                remote_mtu = ldp_detail.get('remote_mtu', '-')
+                local_control_word = ldp_detail.get('local_control_word', '-')
+                remote_control_word = ldp_detail.get('remote_control_word', '-')
+                current_control_word = ldp_detail.get('current_control_word', '-')
+                local_pw_status_capability = ldp_detail.get('local_pw_status_capability', '-')
+                remote_pw_status_capability = ldp_detail.get('remote_pw_status_capability', '-')
+                current_pw_status_tlv = ldp_detail.get('current_pw_status_tlv', '-')
+                local_pw_status = ldp_detail.get('local_pw_status', '-')
+                remote_pw_status = ldp_detail.get('remote_pw_status', '-')
+                local_vccv_capability = ldp_detail.get('local_vccv_capability', '-')
+                remote_vccv_capability = ldp_detail.get('remote_vccv_capability', '-')
 
                 # Format display fields
                 state_display = '✅ UP' if state.lower() == 'up' else '❌ Down'
@@ -7431,7 +7452,19 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output):
                     'service_name': service_name,
                     'vc_state': vc_state,
                     'interface': interface,
+                    'local_mtu': local_mtu,
+                    'remote_mtu': remote_mtu,
                     'vc_type': vc_type,
+                    'local_control_word': local_control_word,
+                    'remote_control_word': remote_control_word,
+                    'current_control_word': current_control_word,
+                    'local_pw_status_capability': local_pw_status_capability,
+                    'remote_pw_status_capability': remote_pw_status_capability,
+                    'current_pw_status_tlv': current_pw_status_tlv,
+                    'local_pw_status': local_pw_status,
+                    'remote_pw_status': remote_pw_status,
+                    'local_vccv_capability': local_vccv_capability,
+                    'remote_vccv_capability': remote_vccv_capability,
                     'result': result
                 })
 
@@ -7442,11 +7475,232 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output):
             'state': '-', 'master_backup': '-', 'send_interval': '-', 'receive_interval': '-',
             'detect_mult': '-', 'local_discr': '-', 'remote_discr': '-', 'discr_state': '-',
             'first_pkt': '-', 'cc_en': '-', 'mep_en': '-', 'vcid': '-',
-            'destination': '-', 'service_name': '-', 'vc_state': '-', 'interface': '-', 'vc_type': '-',
+            'destination': '-', 'service_name': '-', 'vc_state': '-', 'interface': '-', 
+            'local_mtu': '-', 'remote_mtu': '-', 'vc_type': '-',
+            'local_control_word': '-', 'remote_control_word': '-', 'current_control_word': '-',
+            'local_pw_status_capability': '-', 'remote_pw_status_capability': '-', 
+            'current_pw_status_tlv': '-', 'local_pw_status': '-', 'remote_pw_status': '-',
+            'local_vccv_capability': '-', 'remote_vccv_capability': '-',
             'result': 'normal'
         })
 
     return sessions
+
+
+
+def parse_ldp_l2vc_detail(ldp_detail_output):
+    """解析show ldp l2vc detail命令输出，返回按VCID索引的详细信息"""
+    ldp_data_by_vcid = {}
+    
+    if not ldp_detail_output:
+        print("Debug: ldp_detail_output 为空")
+        return ldp_data_by_vcid
+    
+    print(f"Debug: 开始解析LDP详细输出，总长度: {len(ldp_detail_output)}")
+    
+    lines = ldp_detail_output.split('\n')
+    current_vcid = None
+    current_data = {}
+    parsing_local_pw_status = False
+    parsing_remote_pw_status = False
+    parsing_local_vccv = False
+    parsing_remote_vccv = False
+    
+    for i, line in enumerate(lines):
+        original_line = line
+        line = line.strip()
+        
+        # 打印前50行的调试信息以便观察
+        if i < 50:
+            print(f"Debug: 行{i}: '{original_line}' -> '{line}'")
+        
+        # 匹配VCID行 - 格式: vcid: 105, type: ethernet, ...
+        if line.startswith('vcid:'):
+            # print(f"Debug: 找到VCID行: {line}")
+            
+            # 保存上一个VCID的数据
+            if current_vcid and current_data:
+                # print(f"Debug: 保存VCID {current_vcid} 的数据: {current_data}")
+                ldp_data_by_vcid[current_vcid] = current_data.copy()
+            
+            # 开始新的VCID - 提取VCID号码
+            try:
+                vcid_part = line.split(',')[0]  # 获取 "vcid: 105" 部分
+                current_vcid = vcid_part.split(':')[1].strip()
+                # print(f"Debug: 提取到VCID: {current_vcid}")
+            except Exception as e:
+                # print(f"Debug: VCID提取失败: {e}")
+                continue
+                
+            current_data = {
+                'local_mtu': '-',
+                'remote_mtu': '-',
+                'local_control_word': '-',
+                'remote_control_word': '-',
+                'current_control_word': '-',
+                'local_pw_status_capability': '-',
+                'remote_pw_status_capability': '-',
+                'current_pw_status_tlv': '-',
+                'local_pw_status': '',
+                'remote_pw_status': '',
+                'local_vccv_capability': '-',
+                'remote_vccv_capability': '-'
+            }
+            
+            # 重置解析状态
+            parsing_local_pw_status = False
+            parsing_remote_pw_status = False
+            parsing_local_vccv = False
+            parsing_remote_vccv = False
+            continue
+        
+        if not current_vcid:
+            continue
+            
+        # 解析MTU信息 - 格式: Local MTU: 1500, Remote MTU: 1500
+        if 'Local MTU:' in line and 'Remote MTU:' in line:
+            # print(f"Debug: 找到MTU行: {line}")
+            parts = line.split(',')
+            for part in parts:
+                part = part.strip()
+                if 'Local MTU:' in part:
+                    current_data['local_mtu'] = part.split(':')[1].strip()
+                elif 'Remote MTU:' in part:
+                    current_data['remote_mtu'] = part.split(':')[1].strip()
+            # print(f"Debug: MTU解析结果 - Local: {current_data['local_mtu']}, Remote: {current_data['remote_mtu']}")
+        
+        # 解析控制字信息
+        elif 'Local Control Word:' in line:
+            # print(f"Debug: 找到控制字行: {line}")
+            parts = line.split(',')
+            for part in parts:
+                part = part.strip()
+                if 'Local Control Word:' in part:
+                    current_data['local_control_word'] = part.split(':')[1].strip()
+                elif 'Remote Control Word:' in part:
+                    current_data['remote_control_word'] = part.split(':')[1].strip()
+                elif 'Current use:' in part:
+                    current_data['current_control_word'] = part.split(':')[1].strip()
+            # print(f"Debug: 控制字解析结果 - Local: {current_data['local_control_word']}, Remote: {current_data['remote_control_word']}, Current: {current_data['current_control_word']}")
+        
+        # 解析PW状态能力
+        elif 'Local PW Status Capability' in line:
+            # print(f"Debug: 找到本地PW状态能力: {line}")
+            current_data['local_pw_status_capability'] = line.split(':')[1].strip()
+        elif 'Remote PW Status Capability' in line:
+            # print(f"Debug: 找到远程PW状态能力: {line}")
+            current_data['remote_pw_status_capability'] = line.split(':')[1].strip()
+        elif 'Current PW Status TLV' in line:
+            # print(f"Debug: 找到当前PW状态TLV: {line}")
+            current_data['current_pw_status_tlv'] = line.split(':')[1].strip()
+        
+        # 解析本地PW状态 - 修正：更准确地识别状态标题行
+        elif line == 'Local PW Status :' or line.startswith('Local PW Status'):
+            # print(f"Debug: 开始解析本地PW状态")
+            parsing_local_pw_status = True
+            parsing_remote_pw_status = False
+            parsing_local_vccv = False
+            parsing_remote_vccv = False
+            current_data['local_pw_status'] = ''
+            continue
+        elif line == 'Remote PW Status :' or line.startswith('Remote PW Status'):
+            # print(f"Debug: 开始解析远程PW状态")
+            parsing_local_pw_status = False
+            parsing_remote_pw_status = True
+            parsing_local_vccv = False
+            parsing_remote_vccv = False
+            current_data['remote_pw_status'] = ''
+            continue
+        
+        # 解析VCCV能力
+        elif 'Local VCCV Capability:' in line:
+            # print(f"Debug: 开始解析本地VCCV能力")
+            parsing_local_pw_status = False
+            parsing_remote_pw_status = False  
+            parsing_local_vccv = True
+            parsing_remote_vccv = False
+            continue
+        elif 'Remote VCCV Capability:' in line:
+            # print(f"Debug: 开始解析远程VCCV能力")
+            parsing_local_pw_status = False
+            parsing_remote_pw_status = False
+            parsing_local_vccv = False
+            parsing_remote_vccv = True
+            continue
+        
+        # 处理状态行 - 修正：更精确的状态解析逻辑
+        elif parsing_local_pw_status:
+            # 检查是否遇到新的段落开始（结束当前状态解析）
+            if (line.startswith('Remote PW Status') or 
+                line.startswith('Local VCCV') or 
+                line.startswith('Remote VCCV') or 
+                line.startswith('vcid:')):
+                parsing_local_pw_status = False
+                # 处理新段落的开始
+                if line.startswith('Remote PW Status'):
+                    parsing_remote_pw_status = True
+                    current_data['remote_pw_status'] = ''
+                    continue
+                elif line.startswith('Local VCCV'):
+                    parsing_local_vccv = True
+                    continue
+                elif line.startswith('Remote VCCV'):
+                    parsing_remote_vccv = True
+                    continue
+                # 如果是vcid行，不要continue，让它在下一轮被处理
+            
+            # 修正：更宽松的状态值识别条件
+            elif line and line not in ['', ' '] and not line.startswith('CC-Types:') and not line.startswith('CV-Types:'):
+                # 检查是否是有效的状态值（排除明显的非状态行）
+                if not any(keyword in line for keyword in ['destination:', 'Local label:', 'Access IF:', 'Network IF:']):
+                    # print(f"Debug: 找到本地PW状态: '{line}'")
+                    if current_data['local_pw_status']:
+                        current_data['local_pw_status'] += ', ' + line
+                    else:
+                        current_data['local_pw_status'] = line
+                    
+        elif parsing_remote_pw_status:
+            # 检查是否遇到新的段落开始  
+            if (line.startswith('Local VCCV') or 
+                line.startswith('Remote VCCV') or 
+                line.startswith('vcid:')):
+                parsing_remote_pw_status = False
+                if line.startswith('Local VCCV'):
+                    parsing_local_vccv = True
+                    continue
+                elif line.startswith('Remote VCCV'):
+                    parsing_remote_vccv = True
+                    continue
+                # 如果是vcid行，不要continue，让它在下一轮被处理
+                    
+            # 修正：更宽松的状态值识别条件
+            elif line and line not in ['', ' '] and not line.startswith('CC-Types:') and not line.startswith('CV-Types:'):
+                # 检查是否是有效的状态值（排除明显的非状态行）
+                if not any(keyword in line for keyword in ['destination:', 'Local label:', 'Access IF:', 'Network IF:']):
+                    # print(f"Debug: 找到远程PW状态: '{line}'")
+                    if current_data['remote_pw_status']:
+                        current_data['remote_pw_status'] += ', ' + line
+                    else:
+                        current_data['remote_pw_status'] = line
+        
+        # 处理VCCV CC-Types
+        elif parsing_local_vccv and 'CC-Types:' in line:
+            cc_types = line.replace('CC-Types:', '').strip()
+            # print(f"Debug: 找到本地VCCV CC-Types: {cc_types}")
+            current_data['local_vccv_capability'] = cc_types
+        elif parsing_remote_vccv and 'CC-Types:' in line:
+            cc_types = line.replace('CC-Types:', '').strip()
+            # print(f"Debug: 找到远程VCCV CC-Types: {cc_types}")
+            current_data['remote_vccv_capability'] = cc_types
+    
+    # 保存最后一个VCID的数据
+    if current_vcid and current_data:
+        # print(f"Debug: 保存最后一个VCID {current_vcid} 的数据: {current_data}")
+        ldp_data_by_vcid[current_vcid] = current_data
+    
+    
+    # print(f"Debug: 最终解析结果: {ldp_data_by_vcid}")
+    return ldp_data_by_vcid
 
 
 def parse_cfgchk_info(output):
@@ -9117,7 +9371,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     title_font = Font(bold=True, size=14)
     hyperlink_font = Font(color="0000FF", underline="single", size=11)
 
-    # Set column widths 
+    # Set column widths
     ws_summary.column_dimensions['A'].width = 20
     ws_summary.column_dimensions['B'].width = 30
     ws_summary.column_dimensions['C'].width = 12
@@ -9125,7 +9379,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     ws_summary.column_dimensions['E'].width = 15
     ws_summary.column_dimensions['F'].width = 15
 
-    # Title and header rows 
+    # Title and header rows
     ws_summary.merge_cells('A1:F1')
     ws_summary['A1'] = "STN-A设备运维质量评估报告"
     ws_summary['A1'].font = title_font
@@ -9142,14 +9396,14 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         cell.alignment = center_alignment
         cell.border = thin_border
 
-    # Read host file 
+    # Read host file
     with open(host_file, "r", encoding='gbk', errors='ignore') as f:
         reader = csv.reader(f)
         host_ips = [row[0].strip() for row in reader]
         print(
             f"{Fore.GREEN}[DEBUG] Loaded {len(host_ips)} devices{Style.RESET_ALL}")
 
-    # Read raw data 
+    # Read raw data
     data = {}
     with open(raw_file, "r", encoding='utf-8') as f:
         csv.field_size_limit(sys.maxsize)
@@ -9166,7 +9420,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] Loaded data for {ip}, cmd: {cmd}{Style.RESET_ALL}")
 
-    # Read connection failures 
+    # Read connection failures
     connection_failures = {}
     try:
         with open("failure_ips.tmp", "r", encoding='utf-8') as f:
@@ -9181,7 +9435,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         print(
             f"{Fore.YELLOW}[DEBUG] No failure_ips.tmp found{Style.RESET_ALL}")
 
-    # Organize inspection items by category 
+    # Organize inspection items by category
     categories = {
         "设备基础状态": [item for item in selected_items if item["category"] == "设备基础状态"],
         "硬件可靠性": [item for item in selected_items if item["category"] == "硬件可靠性"],
@@ -9196,7 +9450,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     health_scores = {}
     item_counts = {}
 
-    # Process Loopback addresses 
+    # Process Loopback addresses
     loopback31_addresses = {}
     loopback1023_addresses = {}
     for ip in host_ips:
@@ -9267,7 +9521,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[sheet_name] = f"{health_percentage:.0f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "主控盘运行状态":
             headers = ["网元类型", "网元名称", "网元IP", "CPU使用率",
@@ -9311,8 +9566,9 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 # 计算健康度
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
-                health_scores[sheet_name] = f"{health_percentage:.0f}%" 
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                health_scores[sheet_name] = f"{health_percentage:.0f}%"
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "协议报文处理状态":
             headers = ["网元类型", "网元名称", "网元IP", "协议类型",
@@ -9371,7 +9627,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "真实版本信息":
             headers = ["网元类型", "网元名称", "网元IP", "组件类型", "版本标识",
@@ -9443,7 +9700,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "风扇转速及温度状态":
             headers = ["网元类型", "网元名称", "网元IP", "风扇状态", "风扇速度",
@@ -9526,7 +9784,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "系统与硬件版本状态":
             headers = ["网元类型", "网元名称", "设备MAC", "网元IP", "系统版本", "运行时间", "对象ID", "槽位", "板卡名称",
@@ -9619,7 +9878,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                                          100) if total_results > 0 else 0
                     health_scores[item['sheet_name']
                                   ] = f"{health_percentage:.0f}%"
-                    item_counts[item['sheet_name']] = (normal_results, total_results)
+                    item_counts[item['sheet_name']] = (
+                        normal_results, total_results)
 
         elif item['name'] == "光模块信息检查":
             headers = [
@@ -9717,7 +9977,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "电源状态":
             headers = ["网元类型", "网元名称", "网元IP", "槽位", "当前电压", "电压比", "Result"]
@@ -9785,7 +10046,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "主备主控软件版本一致性检查":
             headers = ["网元类型", "网元名称", "网元IP", "主用版本", "备用版本", "Result"]
@@ -9828,7 +10090,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "板卡CPU内存使用率":
             headers = [
@@ -9969,7 +10232,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "硬盘资源占用分析":
             headers = ["网元类型", "网元名称", "网元IP", "总容量",
@@ -10017,13 +10281,17 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 health_percentage = (
                     normal_results / total_results * 100) if total_results > 0 else 0
                 health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (normal_results, total_results)
+                item_counts[item['sheet_name']] = (
+                    normal_results, total_results)
 
         elif item['name'] == "BFD会话检查(VC业务统计)":
             headers = [
                 "网元类型", "网元名称", "网元IP", "APS组ID", "会话名称", "本地ID", "远端ID", "状态", "主备角色",
                 "发送间隔", "接收间隔", "检测倍数", "本地鉴别器", "远端鉴别器", "鉴别器状态", "首次报文接收",
-                "连续性检查", "MEP启用", "loopback31地址", "VCID", "目的地址", "业务名称", "VC状态", "接口", "VC类型", "Result"
+                "连续性检查", "MEP启用", "loopback31地址", "VCID", "目的地址", "业务名称", "VC状态", "接口", 
+                "本地MTU", "远端MTU", "VC类型", "本地控制字", "远端控制字", "当前使用控制字", 
+                "本地伪线状态能力", "远端伪线状态能力", "当前伪线状态TLV", "本地伪线状态", "远端伪线状态", 
+                "本地VCCV能力", "远端VCCV能力", "Result"
             ]
             ws.append(headers)
             for cell in ws[1]:
@@ -10044,17 +10312,21 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show bfd session brief" not in data[ip] or "show bfd configuration pw" not in data[ip] or "show mpls l2vc brief" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 22 + ["error"])
+                              ["无数据"] * 34 + ["error"])  # 更新列数从22到34
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
-                    ws.cell(row=ws.max_row, column=26).fill = orange_fill
+                    ws.cell(row=ws.max_row, column=38).fill = orange_fill  # 更新Result列位置从26到38
                     continue
                 brief_output = data[ip]["show bfd session brief"]
                 config_output = data[ip]["show bfd configuration pw"]
                 l2vc_output = data[ip]["show mpls l2vc brief"]
-                bfd_data = item['parser'](
-                    brief_output, config_output, l2vc_output)
+                # 添加LDP L2VC详细信息的获取
+                ldp_detail_output = data[ip].get("show ldp l2vc detail", "")
+                
+                # 直接调用我们增强的解析函数
+                bfd_data = parse_bfd_sessions(
+                    brief_output, config_output, l2vc_output, ldp_detail_output)
                 start_row = ws.max_row + 1
                 for session in bfd_data:
                     total_results += 1
@@ -10064,8 +10336,12 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         session['state'], session['master_backup'], session['send_interval'], session['receive_interval'],
                         session['detect_mult'], session['local_discr'], session['remote_discr'], session['discr_state'],
                         session['first_pkt'], session['cc_en'], session['mep_en'], loopback31_address, session['vcid'],
-                        session['destination'], session['service_name'], session['vc_state'], session['interface'], session['vc_type'],
-                        session['result']
+                        session['destination'], session['service_name'], session['vc_state'], session['interface'], 
+                        session['local_mtu'], session['remote_mtu'], session['vc_type'],
+                        session['local_control_word'], session['remote_control_word'], session['current_control_word'],
+                        session['local_pw_status_capability'], session['remote_pw_status_capability'], 
+                        session['current_pw_status_tlv'], session['local_pw_status'], session['remote_pw_status'],
+                        session['local_vccv_capability'], session['remote_vccv_capability'], session['result']
                     ])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
@@ -10073,7 +10349,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     if session['result'] == "normal":
                         normal_results += 1
                     else:
-                        ws.cell(row=ws.max_row, column=26).fill = orange_fill
+                        ws.cell(row=ws.max_row, column=38).fill = orange_fill  # 更新Result列位置
                 end_row = ws.max_row
                 if start_row < end_row:
                     for col in range(1, 4):  # Merge 网元类型, 网元名称, 网元IP
@@ -10085,7 +10361,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-
+        
         elif item['name'] == "配置校验状态":
             headers = ["网元类型", "网元名称", "网元IP", "配置校验功能状态",
                        "每小时校验时间点(分钟)", "配置自动恢复等待时间(H:M)", "Result"]
@@ -11417,6 +11693,37 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         ],
 
     ]
+
+    guide_content_mapping = guide_content
+    # 生成选中项目的指南内容
+    guide_content = []
+    counter = 1
+    for item in selected_items:
+        item_name = item['name']
+        if item_name in guide_content_mapping:
+            guide_row = guide_content_mapping[item_name].copy()
+            guide_row[0] = str(counter)  # 重新编号
+            guide_content.append(guide_row)
+            counter += 1
+
+    # 如果没有选中任何项目，则不添加任何指南内容
+    if guide_content:
+        for row_data in guide_content:
+            ws_guide.append(row_data)
+            for cell in ws_guide[ws_guide.max_row]:
+                cell.alignment = center_alignment
+                cell.border = thin_border
+
+        for col_idx, width in enumerate([8, 25, 45, 35, 20], 1):
+            ws_guide.column_dimensions[get_column_letter(
+                col_idx)].width = width
+    else:
+        # 如果没有选中项目，添加提示信息
+        ws_guide.append(["无", "未选择任何检查项目", "请先选择检查项目", "无规则", "无命令"])
+        for cell in ws_guide[ws_guide.max_row]:
+            cell.alignment = center_alignment
+            cell.border = thin_border
+
     for row_data in guide_content:
         ws_guide.append(row_data)
         for cell in ws_guide[ws_guide.max_row]:
@@ -11432,43 +11739,46 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         # 合并分类单元格
         merge_end_row = row + len(items) - 1
         ws_summary.merge_cells(f'A{row}:A{merge_end_row}')
-        
+
         # 写入分类名称并设置样式
         category_cell = ws_summary.cell(row=row, column=1, value=category)
         category_cell.fill = yellow_fill  # 黄色背景
         category_cell.alignment = center_alignment  # 居中
         category_cell.border = thin_border  # 细边框
         category_cell.font = header_font  # 标题字体
-    
+
         # 遍历每个检查项
         for item in items:
             sheet_name = item['sheet_name']
             health_percent = health_scores.get(sheet_name, "0%")
             print(f"分类: {category}, 项目: {item['name']}, 健康度: {health_percent}")
             normal_count, total_count = item_counts.get(sheet_name, (0, 0))
-    
+
             # 写入检查项名称（带超链接）
             cell = ws_summary.cell(row=row, column=2, value=item['name'])
             cell.hyperlink = f"#'{sheet_name}'!A1"  # 添加工作表超链接
             cell.font = hyperlink_font  # 超链接字体
             cell.alignment = center_alignment
             cell.border = thin_border
-    
+
             # 健康度百分比
-            ws_summary.cell(row=row, column=3, value=health_percent).alignment = center_alignment
+            ws_summary.cell(row=row, column=3,
+                            value=health_percent).alignment = center_alignment
             ws_summary.cell(row=row, column=3).border = thin_border
-    
+
             # 生成进度条
             percent_value_str = health_percent.rstrip('%')
             percent_value = int(float(percent_value_str))
             progress_bar = create_progress_bar(percent_value)  # 创建文本进度条
-            ws_summary.cell(row=row, column=4, value=progress_bar).alignment = left_alignment
+            ws_summary.cell(row=row, column=4,
+                            value=progress_bar).alignment = left_alignment
             ws_summary.cell(row=row, column=4).border = thin_border
-    
+
             # 设备数量统计
-            ws_summary.cell(row=row, column=5, value=f"{normal_count}/{total_count}").alignment = center_alignment
+            ws_summary.cell(
+                row=row, column=5, value=f"{normal_count}/{total_count}").alignment = center_alignment
             ws_summary.cell(row=row, column=5).border = thin_border
-    
+
             # 状态指示灯
             status_cell = ws_summary.cell(row=row, column=6)
             if percent_value >= 90:
@@ -11485,7 +11795,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 status_cell.fill = light_red_fill  # 浅红色
             status_cell.alignment = center_alignment
             status_cell.border = thin_border
-    
+
             row += 1  # 移动到下一行
     # Add connection status row
     ws_summary.cell(row=row, column=1, value="设备网管状态").fill = yellow_fill
@@ -11549,13 +11859,13 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 filter_range = f"A{header_row}:{get_column_letter(last_col)}{last_row}"
                 ws.auto_filter.ref = filter_range
                 print(
-                    f"{Fore.GREEN}[INFO] 添加了筛选: {sheet_name}, range: {filter_range}{Style.RESET_ALL}")
+                    f"{Fore.GREEN}[INFO] 添加了筛选: {sheet_name}, 范围: {filter_range}{Style.RESET_ALL}")
 
             # 添加冻结首行功能
             # freeze_panes='A2' 表示冻结第1行，从第2行开始可以滚动
             ws.freeze_panes = 'A2'
             print(
-                f"{Fore.GREEN}[INFO] 添加冻结首行窗格: {sheet_name}, frozen first row{Style.RESET_ALL}")
+                f"{Fore.GREEN}[INFO] 添加冻结首行窗格: {sheet_name}, 冻结第一行{Style.RESET_ALL}")
 
     # Save workbook
     wb.save(report_file)
@@ -11659,7 +11969,7 @@ if __name__ == '__main__':
 
     while True:  # 主循环
         print("\n" + "="*50)
-        print(f"{Fore.CYAN}STN-A设备巡检系统 v2.6{Style.RESET_ALL}".center(50))
+        print(f"{Fore.CYAN}STN-A设备巡检系统 v2.7{Style.RESET_ALL}".center(50))
         print("="*50)
 
         menu = f"""
@@ -12139,7 +12449,7 @@ if __name__ == '__main__':
                 "13": {
                     "name": "BFD会话检查(VC业务统计)",
                     "command": "show bfd session brief",
-                    "parser": lambda brief_output, config_output, l2vc_output: parse_bfd_sessions(brief_output, config_output, l2vc_output),
+                    "parser": parse_bfd_sessions,  # 直接引用函数，不使用lambda
                     "sheet_name": "BFD会话检查(VC业务统计)",
                     "category": "路由协议健康度"
                 },
@@ -12276,7 +12586,8 @@ if __name__ == '__main__':
                 # QA文件清洗模式
                 print(
                     f"{Fore.GREEN}[INFO] 触发QA文件清洗模式，仅处理已有数据{Style.RESET_ALL}")
-                raw_file = getinput("qa_wash_raw.txt", "原始数据文件（默认：qa_wash_raw.txt）：")
+                raw_file = getinput("qa_wash_raw.txt",
+                                    "原始数据文件（默认：qa_wash_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
@@ -12339,6 +12650,7 @@ if __name__ == '__main__':
                     commands.append("show bfd configuration pw")
                     commands.append("show mpls l2vc brief")
                     commands.append("show interface loopback 31")
+                    commands.append("show ldp l2vc detail")
                 if any(item['name'] == "配置校验状态" for item in selected_items):
                     commands.append("show cfgchk info")
                 if any(item['name'] == "OSPF会话进程检查" for item in selected_items):
@@ -12386,7 +12698,7 @@ if __name__ == '__main__':
                 raw_file = getinput("qa_raw.txt", "原始数据文件（默认：qa_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
-                _progress_bar(9, "🚀 会话就绪")
+                _progress_bar(5, "🚀 会话就绪")
                 fish_multiple_cmds(host_file, raw_file, commands)
 
                 # 添加复制文件的功能
@@ -12408,7 +12720,7 @@ if __name__ == '__main__':
                     print(
                         f"{Fore.RED}[WARNING] 原始文件 {raw_file} 不存在，跳过复制操作{Style.RESET_ALL}")
 
-                _progress_bar(5, "🚀 清洗就绪")
+                _progress_bar(3, "🚀 清洗就绪")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
