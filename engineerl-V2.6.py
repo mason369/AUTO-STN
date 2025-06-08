@@ -1,13 +1,13 @@
 """
-STN-A设备巡检系统 v2.7
+STN-A设备巡检系统 v2.6
 使用前需手动安装模块：pip install openpyxl pytz paramiko tqdm colorama pyinstaller
 更新说明：
-- 增强功能BFD会话检查(VC业务统计)
+
 - 修复若干BUG
         
 作者：杨茂森
 
-最后更新：2025-5-30
+最后更新：2025-5-16
 """
 # 导入必要的库
 from openpyxl.styles import PatternFill, Alignment, Border, Side
@@ -7251,6 +7251,118 @@ def check_mpls_lsp(lsp):
     return result, "; ".join(suggestions) if suggestions else "-"
 
 
+def parse_ldp_l2vc_detail(ldp_detail_output):
+    """解析show ldp l2vc detail命令输出，返回按VCID索引的详细信息"""
+    ldp_data_by_vcid = {}
+
+    if not ldp_detail_output:
+        return ldp_data_by_vcid
+
+    lines = ldp_detail_output.split('\n')
+    current_vcid = None
+    current_data = {}
+
+    for line in lines:
+        line = line.strip()
+
+        # 匹配VCID行
+        if line.startswith('vcid:'):
+            # 保存上一个VCID的数据
+            if current_vcid and current_data:
+                ldp_data_by_vcid[current_vcid] = current_data.copy()
+
+            # 开始新的VCID
+            current_vcid = line.split(',')[0].split(':')[1].strip()
+            current_data = {
+                'local_mtu': '-',
+                'remote_mtu': '-',
+                'local_control_word': '-',
+                'remote_control_word': '-',
+                'current_control_word': '-',
+                'local_pw_status_capability': '-',
+                'remote_pw_status_capability': '-',
+                'current_pw_status_tlv': '-',
+                'local_pw_status': '-',
+                'remote_pw_status': '-',
+                'local_vccv_capability': '-',
+                'remote_vccv_capability': '-'
+            }
+            continue
+
+        if current_vcid:
+            # 解析MTU信息
+            if 'Local MTU:' in line and 'Remote MTU:' in line:
+                parts = line.split(',')
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith('Local MTU:'):
+                        current_data['local_mtu'] = part.split(':')[1].strip()
+                    elif part.startswith('Remote MTU:'):
+                        current_data['remote_mtu'] = part.split(':')[1].strip()
+
+            # 解析控制字信息
+            elif 'Local Control Word:' in line:
+                parts = line.split(',')
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith('Local Control Word:'):
+                        current_data['local_control_word'] = part.split(':')[
+                            1].strip()
+                    elif part.startswith('Remote Control Word:'):
+                        current_data['remote_control_word'] = part.split(':')[
+                            1].strip()
+                    elif part.startswith('Current use:'):
+                        current_data['current_control_word'] = part.split(':')[
+                            1].strip()
+
+            # 解析PW状态能力
+            elif line.startswith('Local PW Status Capability'):
+                current_data['local_pw_status_capability'] = line.split(':')[
+                    1].strip()
+            elif line.startswith('Remote PW Status Capability'):
+                current_data['remote_pw_status_capability'] = line.split(':')[
+                    1].strip()
+            elif line.startswith('Current PW Status TLV'):
+                current_data['current_pw_status_tlv'] = line.split(':')[
+                    1].strip()
+
+            # 解析本地PW状态
+            elif line.startswith('Local PW Status'):
+                local_status = []
+                continue  # 跳过标题行，读取后续状态
+            elif line.startswith('Forwarding') or line.startswith('Active'):
+                if 'local_pw_status' not in current_data or current_data['local_pw_status'] == '-':
+                    current_data['local_pw_status'] = line
+                else:
+                    current_data['local_pw_status'] += ', ' + line
+
+            # 解析远端PW状态
+            elif line.startswith('Remote PW Status'):
+                remote_status = []
+                continue  # 跳过标题行，读取后续状态
+
+            # 解析VCCV能力 - 本地
+            elif line.startswith('Local VCCV Capability'):
+                vccv_lines = []
+                continue
+            elif line.startswith('CC-Types:') and 'local_vccv_capability' not in current_data or current_data['local_vccv_capability'] == '-':
+                current_data['local_vccv_capability'] = line.replace(
+                    'CC-Types:', '').strip()
+
+            # 解析VCCV能力 - 远端
+            elif line.startswith('Remote VCCV Capability'):
+                continue
+            elif line.startswith('CC-Types:') and current_data.get('local_vccv_capability', '-') != '-':
+                current_data['remote_vccv_capability'] = line.replace(
+                    'CC-Types:', '').strip()
+
+    # 保存最后一个VCID的数据
+    if current_vcid and current_data:
+        ldp_data_by_vcid[current_vcid] = current_data
+
+    return ldp_data_by_vcid
+
+
 def parse_bfd_sessions(brief_output, config_output, l2vc_output, ldp_detail_output=""):
     # Parse config_output to build config_data_by_local_id
     config_data_by_local_id = {}
@@ -7339,13 +7451,13 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output, ldp_detail_outp
                     'interface': interface,
                     'vc_type': vc_type
                 }
-    
+
     # Parse LDP L2VC detail information
     ldp_data_by_vcid = parse_ldp_l2vc_detail(ldp_detail_output)
-    
+
     # 调试：打印 l2vc_data_by_vcid 以验证所有 VCID 是否被捕获
-    # print(f"Debug: l2vc_data_by_vcid = {l2vc_data_by_vcid}")
-    # print(f"Debug: ldp_data_by_vcid = {ldp_data_by_vcid}")
+    print(f"Debug: l2vc_data_by_vcid = {l2vc_data_by_vcid}")
+    print(f"Debug: ldp_data_by_vcid = {ldp_data_by_vcid}")
 
     # Parse brief_output to get session list
     sessions = []
@@ -7403,21 +7515,28 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output, ldp_detail_outp
                 vc_state = l2vc.get('vc_state', '-')
                 interface = l2vc.get('interface', '-')
                 vc_type = l2vc.get('vc_type', '-')
-                
+
                 # Get LDP L2VC detail information
                 ldp_detail = ldp_data_by_vcid.get(vcid, {})
                 local_mtu = ldp_detail.get('local_mtu', '-')
                 remote_mtu = ldp_detail.get('remote_mtu', '-')
                 local_control_word = ldp_detail.get('local_control_word', '-')
-                remote_control_word = ldp_detail.get('remote_control_word', '-')
-                current_control_word = ldp_detail.get('current_control_word', '-')
-                local_pw_status_capability = ldp_detail.get('local_pw_status_capability', '-')
-                remote_pw_status_capability = ldp_detail.get('remote_pw_status_capability', '-')
-                current_pw_status_tlv = ldp_detail.get('current_pw_status_tlv', '-')
+                remote_control_word = ldp_detail.get(
+                    'remote_control_word', '-')
+                current_control_word = ldp_detail.get(
+                    'current_control_word', '-')
+                local_pw_status_capability = ldp_detail.get(
+                    'local_pw_status_capability', '-')
+                remote_pw_status_capability = ldp_detail.get(
+                    'remote_pw_status_capability', '-')
+                current_pw_status_tlv = ldp_detail.get(
+                    'current_pw_status_tlv', '-')
                 local_pw_status = ldp_detail.get('local_pw_status', '-')
                 remote_pw_status = ldp_detail.get('remote_pw_status', '-')
-                local_vccv_capability = ldp_detail.get('local_vccv_capability', '-')
-                remote_vccv_capability = ldp_detail.get('remote_vccv_capability', '-')
+                local_vccv_capability = ldp_detail.get(
+                    'local_vccv_capability', '-')
+                remote_vccv_capability = ldp_detail.get(
+                    'remote_vccv_capability', '-')
 
                 # Format display fields
                 state_display = '✅ UP' if state.lower() == 'up' else '❌ Down'
@@ -7475,232 +7594,16 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output, ldp_detail_outp
             'state': '-', 'master_backup': '-', 'send_interval': '-', 'receive_interval': '-',
             'detect_mult': '-', 'local_discr': '-', 'remote_discr': '-', 'discr_state': '-',
             'first_pkt': '-', 'cc_en': '-', 'mep_en': '-', 'vcid': '-',
-            'destination': '-', 'service_name': '-', 'vc_state': '-', 'interface': '-', 
+            'destination': '-', 'service_name': '-', 'vc_state': '-', 'interface': '-',
             'local_mtu': '-', 'remote_mtu': '-', 'vc_type': '-',
             'local_control_word': '-', 'remote_control_word': '-', 'current_control_word': '-',
-            'local_pw_status_capability': '-', 'remote_pw_status_capability': '-', 
+            'local_pw_status_capability': '-', 'remote_pw_status_capability': '-',
             'current_pw_status_tlv': '-', 'local_pw_status': '-', 'remote_pw_status': '-',
             'local_vccv_capability': '-', 'remote_vccv_capability': '-',
             'result': 'normal'
         })
 
     return sessions
-
-
-
-def parse_ldp_l2vc_detail(ldp_detail_output):
-    """解析show ldp l2vc detail命令输出，返回按VCID索引的详细信息"""
-    ldp_data_by_vcid = {}
-    
-    if not ldp_detail_output:
-        print("Debug: ldp_detail_output 为空")
-        return ldp_data_by_vcid
-    
-    print(f"Debug: 开始解析LDP详细输出，总长度: {len(ldp_detail_output)}")
-    
-    lines = ldp_detail_output.split('\n')
-    current_vcid = None
-    current_data = {}
-    parsing_local_pw_status = False
-    parsing_remote_pw_status = False
-    parsing_local_vccv = False
-    parsing_remote_vccv = False
-    
-    for i, line in enumerate(lines):
-        original_line = line
-        line = line.strip()
-        
-        # 打印前50行的调试信息以便观察
-        if i < 50:
-            print(f"Debug: 行{i}: '{original_line}' -> '{line}'")
-        
-        # 匹配VCID行 - 格式: vcid: 105, type: ethernet, ...
-        if line.startswith('vcid:'):
-            # print(f"Debug: 找到VCID行: {line}")
-            
-            # 保存上一个VCID的数据
-            if current_vcid and current_data:
-                # print(f"Debug: 保存VCID {current_vcid} 的数据: {current_data}")
-                ldp_data_by_vcid[current_vcid] = current_data.copy()
-            
-            # 开始新的VCID - 提取VCID号码
-            try:
-                vcid_part = line.split(',')[0]  # 获取 "vcid: 105" 部分
-                current_vcid = vcid_part.split(':')[1].strip()
-                # print(f"Debug: 提取到VCID: {current_vcid}")
-            except Exception as e:
-                # print(f"Debug: VCID提取失败: {e}")
-                continue
-                
-            current_data = {
-                'local_mtu': '-',
-                'remote_mtu': '-',
-                'local_control_word': '-',
-                'remote_control_word': '-',
-                'current_control_word': '-',
-                'local_pw_status_capability': '-',
-                'remote_pw_status_capability': '-',
-                'current_pw_status_tlv': '-',
-                'local_pw_status': '',
-                'remote_pw_status': '',
-                'local_vccv_capability': '-',
-                'remote_vccv_capability': '-'
-            }
-            
-            # 重置解析状态
-            parsing_local_pw_status = False
-            parsing_remote_pw_status = False
-            parsing_local_vccv = False
-            parsing_remote_vccv = False
-            continue
-        
-        if not current_vcid:
-            continue
-            
-        # 解析MTU信息 - 格式: Local MTU: 1500, Remote MTU: 1500
-        if 'Local MTU:' in line and 'Remote MTU:' in line:
-            # print(f"Debug: 找到MTU行: {line}")
-            parts = line.split(',')
-            for part in parts:
-                part = part.strip()
-                if 'Local MTU:' in part:
-                    current_data['local_mtu'] = part.split(':')[1].strip()
-                elif 'Remote MTU:' in part:
-                    current_data['remote_mtu'] = part.split(':')[1].strip()
-            # print(f"Debug: MTU解析结果 - Local: {current_data['local_mtu']}, Remote: {current_data['remote_mtu']}")
-        
-        # 解析控制字信息
-        elif 'Local Control Word:' in line:
-            # print(f"Debug: 找到控制字行: {line}")
-            parts = line.split(',')
-            for part in parts:
-                part = part.strip()
-                if 'Local Control Word:' in part:
-                    current_data['local_control_word'] = part.split(':')[1].strip()
-                elif 'Remote Control Word:' in part:
-                    current_data['remote_control_word'] = part.split(':')[1].strip()
-                elif 'Current use:' in part:
-                    current_data['current_control_word'] = part.split(':')[1].strip()
-            # print(f"Debug: 控制字解析结果 - Local: {current_data['local_control_word']}, Remote: {current_data['remote_control_word']}, Current: {current_data['current_control_word']}")
-        
-        # 解析PW状态能力
-        elif 'Local PW Status Capability' in line:
-            # print(f"Debug: 找到本地PW状态能力: {line}")
-            current_data['local_pw_status_capability'] = line.split(':')[1].strip()
-        elif 'Remote PW Status Capability' in line:
-            # print(f"Debug: 找到远程PW状态能力: {line}")
-            current_data['remote_pw_status_capability'] = line.split(':')[1].strip()
-        elif 'Current PW Status TLV' in line:
-            # print(f"Debug: 找到当前PW状态TLV: {line}")
-            current_data['current_pw_status_tlv'] = line.split(':')[1].strip()
-        
-        # 解析本地PW状态 - 修正：更准确地识别状态标题行
-        elif line == 'Local PW Status :' or line.startswith('Local PW Status'):
-            # print(f"Debug: 开始解析本地PW状态")
-            parsing_local_pw_status = True
-            parsing_remote_pw_status = False
-            parsing_local_vccv = False
-            parsing_remote_vccv = False
-            current_data['local_pw_status'] = ''
-            continue
-        elif line == 'Remote PW Status :' or line.startswith('Remote PW Status'):
-            # print(f"Debug: 开始解析远程PW状态")
-            parsing_local_pw_status = False
-            parsing_remote_pw_status = True
-            parsing_local_vccv = False
-            parsing_remote_vccv = False
-            current_data['remote_pw_status'] = ''
-            continue
-        
-        # 解析VCCV能力
-        elif 'Local VCCV Capability:' in line:
-            # print(f"Debug: 开始解析本地VCCV能力")
-            parsing_local_pw_status = False
-            parsing_remote_pw_status = False  
-            parsing_local_vccv = True
-            parsing_remote_vccv = False
-            continue
-        elif 'Remote VCCV Capability:' in line:
-            # print(f"Debug: 开始解析远程VCCV能力")
-            parsing_local_pw_status = False
-            parsing_remote_pw_status = False
-            parsing_local_vccv = False
-            parsing_remote_vccv = True
-            continue
-        
-        # 处理状态行 - 修正：更精确的状态解析逻辑
-        elif parsing_local_pw_status:
-            # 检查是否遇到新的段落开始（结束当前状态解析）
-            if (line.startswith('Remote PW Status') or 
-                line.startswith('Local VCCV') or 
-                line.startswith('Remote VCCV') or 
-                line.startswith('vcid:')):
-                parsing_local_pw_status = False
-                # 处理新段落的开始
-                if line.startswith('Remote PW Status'):
-                    parsing_remote_pw_status = True
-                    current_data['remote_pw_status'] = ''
-                    continue
-                elif line.startswith('Local VCCV'):
-                    parsing_local_vccv = True
-                    continue
-                elif line.startswith('Remote VCCV'):
-                    parsing_remote_vccv = True
-                    continue
-                # 如果是vcid行，不要continue，让它在下一轮被处理
-            
-            # 修正：更宽松的状态值识别条件
-            elif line and line not in ['', ' '] and not line.startswith('CC-Types:') and not line.startswith('CV-Types:'):
-                # 检查是否是有效的状态值（排除明显的非状态行）
-                if not any(keyword in line for keyword in ['destination:', 'Local label:', 'Access IF:', 'Network IF:']):
-                    # print(f"Debug: 找到本地PW状态: '{line}'")
-                    if current_data['local_pw_status']:
-                        current_data['local_pw_status'] += ', ' + line
-                    else:
-                        current_data['local_pw_status'] = line
-                    
-        elif parsing_remote_pw_status:
-            # 检查是否遇到新的段落开始  
-            if (line.startswith('Local VCCV') or 
-                line.startswith('Remote VCCV') or 
-                line.startswith('vcid:')):
-                parsing_remote_pw_status = False
-                if line.startswith('Local VCCV'):
-                    parsing_local_vccv = True
-                    continue
-                elif line.startswith('Remote VCCV'):
-                    parsing_remote_vccv = True
-                    continue
-                # 如果是vcid行，不要continue，让它在下一轮被处理
-                    
-            # 修正：更宽松的状态值识别条件
-            elif line and line not in ['', ' '] and not line.startswith('CC-Types:') and not line.startswith('CV-Types:'):
-                # 检查是否是有效的状态值（排除明显的非状态行）
-                if not any(keyword in line for keyword in ['destination:', 'Local label:', 'Access IF:', 'Network IF:']):
-                    # print(f"Debug: 找到远程PW状态: '{line}'")
-                    if current_data['remote_pw_status']:
-                        current_data['remote_pw_status'] += ', ' + line
-                    else:
-                        current_data['remote_pw_status'] = line
-        
-        # 处理VCCV CC-Types
-        elif parsing_local_vccv and 'CC-Types:' in line:
-            cc_types = line.replace('CC-Types:', '').strip()
-            # print(f"Debug: 找到本地VCCV CC-Types: {cc_types}")
-            current_data['local_vccv_capability'] = cc_types
-        elif parsing_remote_vccv and 'CC-Types:' in line:
-            cc_types = line.replace('CC-Types:', '').strip()
-            # print(f"Debug: 找到远程VCCV CC-Types: {cc_types}")
-            current_data['remote_vccv_capability'] = cc_types
-    
-    # 保存最后一个VCID的数据
-    if current_vcid and current_data:
-        # print(f"Debug: 保存最后一个VCID {current_vcid} 的数据: {current_data}")
-        ldp_data_by_vcid[current_vcid] = current_data
-    
-    
-    # print(f"Debug: 最终解析结果: {ldp_data_by_vcid}")
-    return ldp_data_by_vcid
 
 
 def parse_cfgchk_info(output):
@@ -10288,10 +10191,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             headers = [
                 "网元类型", "网元名称", "网元IP", "APS组ID", "会话名称", "本地ID", "远端ID", "状态", "主备角色",
                 "发送间隔", "接收间隔", "检测倍数", "本地鉴别器", "远端鉴别器", "鉴别器状态", "首次报文接收",
-                "连续性检查", "MEP启用", "loopback31地址", "VCID", "目的地址", "业务名称", "VC状态", "接口", 
-                "本地MTU", "远端MTU", "VC类型", "本地控制字", "远端控制字", "当前使用控制字", 
-                "本地伪线状态能力", "远端伪线状态能力", "当前伪线状态TLV", "本地伪线状态", "远端伪线状态", 
-                "本地VCCV能力", "远端VCCV能力", "Result"
+                "连续性检查", "MEP启用", "loopback31地址", "VCID", "目的地址", "业务名称", "VC状态", "接口", "VC类型", "Result"
             ]
             ws.append(headers)
             for cell in ws[1]:
@@ -10312,21 +10212,17 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show bfd session brief" not in data[ip] or "show bfd configuration pw" not in data[ip] or "show mpls l2vc brief" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 34 + ["error"])  # 更新列数从22到34
+                              ["无数据"] * 22 + ["error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
-                    ws.cell(row=ws.max_row, column=38).fill = orange_fill  # 更新Result列位置从26到38
+                    ws.cell(row=ws.max_row, column=26).fill = orange_fill
                     continue
                 brief_output = data[ip]["show bfd session brief"]
                 config_output = data[ip]["show bfd configuration pw"]
                 l2vc_output = data[ip]["show mpls l2vc brief"]
-                # 添加LDP L2VC详细信息的获取
-                ldp_detail_output = data[ip].get("show ldp l2vc detail", "")
-                
-                # 直接调用我们增强的解析函数
-                bfd_data = parse_bfd_sessions(
-                    brief_output, config_output, l2vc_output, ldp_detail_output)
+                bfd_data = item['parser'](
+                    brief_output, config_output, l2vc_output)
                 start_row = ws.max_row + 1
                 for session in bfd_data:
                     total_results += 1
@@ -10336,12 +10232,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         session['state'], session['master_backup'], session['send_interval'], session['receive_interval'],
                         session['detect_mult'], session['local_discr'], session['remote_discr'], session['discr_state'],
                         session['first_pkt'], session['cc_en'], session['mep_en'], loopback31_address, session['vcid'],
-                        session['destination'], session['service_name'], session['vc_state'], session['interface'], 
-                        session['local_mtu'], session['remote_mtu'], session['vc_type'],
-                        session['local_control_word'], session['remote_control_word'], session['current_control_word'],
-                        session['local_pw_status_capability'], session['remote_pw_status_capability'], 
-                        session['current_pw_status_tlv'], session['local_pw_status'], session['remote_pw_status'],
-                        session['local_vccv_capability'], session['remote_vccv_capability'], session['result']
+                        session['destination'], session['service_name'], session['vc_state'], session['interface'], session['vc_type'],
+                        session['result']
                     ])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
@@ -10349,7 +10241,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     if session['result'] == "normal":
                         normal_results += 1
                     else:
-                        ws.cell(row=ws.max_row, column=38).fill = orange_fill  # 更新Result列位置
+                        ws.cell(row=ws.max_row, column=26).fill = orange_fill
                 end_row = ws.max_row
                 if start_row < end_row:
                     for col in range(1, 4):  # Merge 网元类型, 网元名称, 网元IP
@@ -10361,7 +10253,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-        
+
         elif item['name'] == "配置校验状态":
             headers = ["网元类型", "网元名称", "网元IP", "配置校验功能状态",
                        "每小时校验时间点(分钟)", "配置自动恢复等待时间(H:M)", "Result"]
@@ -11969,7 +11861,7 @@ if __name__ == '__main__':
 
     while True:  # 主循环
         print("\n" + "="*50)
-        print(f"{Fore.CYAN}STN-A设备巡检系统 v2.7{Style.RESET_ALL}".center(50))
+        print(f"{Fore.CYAN}STN-A设备巡检系统 v2.6{Style.RESET_ALL}".center(50))
         print("="*50)
 
         menu = f"""
@@ -12449,7 +12341,7 @@ if __name__ == '__main__':
                 "13": {
                     "name": "BFD会话检查(VC业务统计)",
                     "command": "show bfd session brief",
-                    "parser": parse_bfd_sessions,  # 直接引用函数，不使用lambda
+                    "parser": lambda brief_output, config_output, l2vc_output: parse_bfd_sessions(brief_output, config_output, l2vc_output),
                     "sheet_name": "BFD会话检查(VC业务统计)",
                     "category": "路由协议健康度"
                 },
@@ -12650,7 +12542,6 @@ if __name__ == '__main__':
                     commands.append("show bfd configuration pw")
                     commands.append("show mpls l2vc brief")
                     commands.append("show interface loopback 31")
-                    commands.append("show ldp l2vc detail")
                 if any(item['name'] == "配置校验状态" for item in selected_items):
                     commands.append("show cfgchk info")
                 if any(item['name'] == "OSPF会话进程检查" for item in selected_items):
@@ -12698,7 +12589,7 @@ if __name__ == '__main__':
                 raw_file = getinput("qa_raw.txt", "原始数据文件（默认：qa_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
-                _progress_bar(5, "🚀 会话就绪")
+                _progress_bar(9, "🚀 会话就绪")
                 fish_multiple_cmds(host_file, raw_file, commands)
 
                 # 添加复制文件的功能
@@ -12720,7 +12611,7 @@ if __name__ == '__main__':
                     print(
                         f"{Fore.RED}[WARNING] 原始文件 {raw_file} 不存在，跳过复制操作{Style.RESET_ALL}")
 
-                _progress_bar(3, "🚀 清洗就绪")
+                _progress_bar(5, "🚀 清洗就绪")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
