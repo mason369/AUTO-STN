@@ -6,10 +6,12 @@ STN-A设备巡检系统 v2.7
 - 修复若干BUG
 - 修改最大连接数为40
 - 新增巡检功能28设备面板视图
+- 新增功能21自动设置互联端口描述
+- 新增QA巡检子功能-BFD保护组状态信息
         
 作者：杨茂森
 
-最后更新：2025-5-16
+最后更新：2025-6-15
 """
 # 导入必要的库
 from openpyxl.styles import PatternFill, Alignment, Border, Side
@@ -64,7 +66,6 @@ workbook = openpyxl.Workbook()  # Creates a new workbook
 init(autoreset=True)
 # 初始化打印锁
 print_lock = Lock()
-
 
 def input_with_timeout(prompt, default, timeout=10):
     print(f"{Fore.CYAN}{prompt}{Style.RESET_ALL}", end='')
@@ -274,6 +275,13 @@ def execute_some_command(channel, command, timeout=5, max_retries=3, command_del
     Returns:
         命令执行的输出结果
     """
+    import select
+    import socket
+    import sys
+    import logging
+    import time
+    from colorama import Fore, Style
+
     if not channel:
         return ""
 
@@ -297,7 +305,7 @@ def execute_some_command(channel, command, timeout=5, max_retries=3, command_del
 
             output = ""
             start_time = time.time()
-            while time.time() - start_time < timeout:
+            while time.time() - start_time < timeout:  # 修复变量名错误
                 rlist, _, _ = select.select([channel], [], [], 5.0)
                 if not rlist:
                     logging.warning(f"命令 {command} 数据接收超时")
@@ -341,11 +349,11 @@ def execute_some_command(channel, command, timeout=5, max_retries=3, command_del
 
         except socket.timeout:
             logging.warning(f"命令执行超时: {command}")
-            return f"**命令执行超时**\n已执行部分输出:\n{output}"
+            return f"命令执行超时\n已执行部分输出:\n{output}"
 
         except Exception as ex:
             logging.error(f"执行命令出错: {ex}")
-            return f"**命令执行错误: {ex}**"
+            return f"命令执行错误: {ex}"
 
     # 如果所有重试都失败，返回最后一次的输出
     return output
@@ -3508,140 +3516,186 @@ def generate_optical_module_report(src_file, dst_file, host_list_file):
     print(f"✅ 报告生成完成，共处理 {len(host_ips)} 台设备")
 
 
-def fish_custom_cmd(host_file, raw_file, commands):
-    """采集自定义指令数据 (Collect Custom Command Data)"""
-    print(
-        f"🐛 [DEBUG] 进入 fish_custom_cmd 函数，参数: host_file={host_file}, raw_file={raw_file}, commands={commands}")
+def fish_custom_cmd(host_file, raw_file, commands, max_workers=40):
+    """采集自定义指令数据 - 多线程版本 (Collect Custom Command Data - Multithreaded)"""
+    import logging
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tqdm import tqdm
+    from colorama import Fore, Style
+
+    logging.basicConfig(filename='custom_cmd.log', level=logging.DEBUG,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+
+    print(f"[START] 开始采集自定义指令数据，输入文件: {host_file}, 输出文件: {raw_file}")
+    print(f"[INFO] 自定义指令列表: {commands}")
+    print(f"[INFO] 最大线程数: {max_workers}")
 
     with open(raw_file, "w", encoding='utf-8', newline='') as revFile, \
             open("failure_ips.tmp", "a", encoding='utf-8') as fail_log:
         writer = csv.writer(revFile)
         try:
-            print(f"🐛 [DEBUG] 正在打开主机文件: {host_file}")
             with open(host_file, "r", encoding='gbk', errors='ignore') as csvFile:
                 reader = csv.reader(csvFile)
                 hostip = list(reader)
                 total_devices = len(hostip)
-                print(f"🐛 [DEBUG] 共读取到 {total_devices} 台设备")
+                print(f"[INFO] 共发现 {total_devices} 台设备")
 
-                with tqdm(total=total_devices, desc="🔍 自定义指令采集进度", unit="台") as pbar:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = []
+                    ip_to_future = {}
+
                     for row_idx, row in enumerate(hostip):
                         # 检查行数据完整性
                         if len(row) < 3:
-                            print(
-                                f"🐛 [DEBUG] ⚠️ 第 {row_idx+1} 行数据不完整，跳过: {row}")
-                            pbar.update(1)
+                            print(f"[WARNING] 第 {row_idx+1} 行数据不完整，跳过: {row}")
                             continue
 
                         ip = row[0].strip()
                         username = row[1].strip()
                         password = row[2].strip()
 
-                        print(
-                            f"\n🐛 [DEBUG] 开始处理设备 {ip} ({row_idx+1}/{total_devices})")
-                        pbar.set_postfix_str(f"设备={ip[:15]}")
+                        future = executor.submit(
+                            process_custom_commands, ip, username, password, commands, writer, fail_log)
+                        futures.append(future)
+                        ip_to_future[future] = ip
 
-                        channel = None
-                        try:
-                            print(f"🐛 [DEBUG] 尝试创建 SSH/Telnet 连接: {ip}")
-                            channel = create_channel(ip, username, password)
-
-                            if channel:
-                                print(f"🐛 [DEBUG] {ip} 连接创建成功")
-                                try:
-                                    # 设置屏幕长度避免分页
-                                    print(
-                                        f"🐛 [DEBUG] {ip} 正在设置 screen-length 512")
-                                    execute_some_command(
-                                        channel, "screen-length 512", 1)
-
-                                    # 执行所有命令
-                                    for cmd_idx, cmd in enumerate(commands):
-                                        try:
-                                            print(
-                                                f"🐛 [DEBUG] {ip} 正在执行命令 ({cmd_idx+1}/{len(commands)}): {cmd}")
-                                            output = execute_some_command(
-                                                channel, cmd, 3)
-                                            print(
-                                                f"🐛 [DEBUG] {ip} 命令执行完成，输出长度: {len(output)} 字符")
-                                            if len(output) > 800:
-                                                print(
-                                                    f"🐛 [DEBUG] {ip} 输出内容（前800字符）: {output[:800]}...")
-                                            else:
-                                                print(
-                                                    f"🐛 [DEBUG] {ip} 输出内容: {output}")
-                                            writer.writerow([ip, cmd, output])
-                                            print(f"🐛 [DEBUG] {ip} 已写入原始数据文件")
-                                        except Exception as single_cmd_error:
-                                            error_msg = f"命令执行失败: {str(single_cmd_error)}"
-                                            print(
-                                                f"🐛 [DEBUG] ⚠️ 设备 {ip} 命令 '{cmd}' 执行异常: {str(single_cmd_error)[:400]}...")
-                                            writer.writerow(
-                                                [ip, cmd, error_msg])
-                                            print(
-                                                f"🐛 [DEBUG] {ip} 写入单个命令错误信息到原始文件")
-
-                                    # 恢复屏幕长度设置
-                                    try:
-                                        print(
-                                            f"🐛 [DEBUG] {ip} 正在恢复 screen-length 25")
-                                        execute_some_command(
-                                            channel, "screen-length 25", 1)
-                                    except Exception as restore_error:
-                                        print(
-                                            f"🐛 [DEBUG] ⚠️ {ip} 恢复屏幕长度设置失败: {restore_error}")
-
-                                except Exception as cmd_error:
-                                    print(
-                                        f"🐛 [DEBUG] ⚠️ 设备 {ip} 命令执行全局异常: {str(cmd_error)[:800]}...")
-                                    # 为所有命令写入错误记录
-                                    for cmd in commands:
-                                        error_msg = f"执行失败: {str(cmd_error)}"
-                                        writer.writerow([ip, cmd, error_msg])
-                                        print(
-                                            f"🐛 [DEBUG] {ip} 写入错误信息到原始文件: {cmd}")
-
-                            else:
-                                print(f"🐛 [DEBUG] ⚠️ {ip} 连接创建失败")
-                                fail_log.write(ip + '\n')
-                                fail_log.flush()  # 立即写入磁盘
-                                # 为所有命令写入连接失败记录
-                                for cmd in commands:
-                                    writer.writerow([ip, cmd, "连接失败"])
-
-                        except Exception as connection_error:
-                            print(
-                                f"🐛 [DEBUG] ⚠️ {ip} 连接异常: {str(connection_error)[:400]}...")
-                            fail_log.write(f"{ip} - {str(connection_error)}\n")
-                            fail_log.flush()  # 立即写入磁盘
-                            # 为所有命令写入连接异常记录
-                            for cmd in commands:
-                                error_msg = f"连接异常: {str(connection_error)}"
-                                writer.writerow([ip, cmd, error_msg])
-
-                        finally:
-                            # 确保连接被正确关闭
-                            if channel:
-                                try:
-                                    print(f"🐛 [DEBUG] {ip} 尝试关闭连接")
-                                    channel.close()
-                                    print(f"🐛 [DEBUG] {ip} 连接已关闭")
-                                except Exception as close_error:
-                                    print(
-                                        f"🐛 [DEBUG] ⚠️ 关闭 {ip} 连接时出错: {close_error}")
-
-                        pbar.update(1)
-                        time.sleep(0.5)  # 避免过于频繁的连接
-                        print(f"🐛 [DEBUG] {ip} 处理完成，进度更新")
+                    with tqdm(total=len(futures), desc="🔍 自定义指令采集进度", unit="台", dynamic_ncols=True) as pbar:
+                        for future in as_completed(futures):
+                            try:
+                                future.result(timeout=180)  # 每个任务最多 180 秒
+                            except TimeoutError:
+                                logging.error(
+                                    f"设备 {ip_to_future[future]} 任务超时")
+                                print(
+                                    f"{Fore.YELLOW}⚠️ 设备 {ip_to_future[future]} 任务超时{Style.RESET_ALL}")
+                            except Exception as e:
+                                logging.error(
+                                    f"设备 {ip_to_future[future]} 线程执行出错: {str(e)}")
+                                print(
+                                    f"{Fore.RED}⚠️ 设备 {ip_to_future[future]} 线程执行出错: {str(e)}{Style.RESET_ALL}")
+                            pbar.update(1)
 
         except FileNotFoundError as file_error:
-            print(f"🐛 [DEBUG] ⚠️ 文件不存在: {file_error}")
-            print(f"⛔ 主机文件读取错误: {file_error}")
+            logging.error(f"主机文件读取错误: {file_error}")
+            print(f"{Fore.RED}⛔ 主机文件读取错误: {file_error}{Style.RESET_ALL}")
         except Exception as e:
-            print(f"🐛 [DEBUG] ⚠️ 数据采集全局异常: {str(e)[:800]}")
-            print(f"⛔ 数据采集错误: {e}")
+            logging.error(f"数据采集错误: {str(e)}")
+            print(f"{Fore.RED}⛔ 数据采集错误: {str(e)}{Style.RESET_ALL}")
 
-    print(f"✅ 数据采集任务完成")
+    print("[END] 自定义指令数据采集完成")
+
+
+def process_custom_commands(ip, username, password, commands, writer, fail_log):
+    """处理单个设备的自定义指令采集"""
+    from threading import Lock
+    import time
+
+    # 文件写入锁和打印锁，确保线程安全
+    file_lock = Lock()
+    print_lock = Lock()  # 添加打印锁
+    channel = None
+
+    try:
+        with print_lock:
+            print(f"\n[DEBUG] {'='*40}")
+            print(f"[DEBUG] 开始处理设备: {ip}")
+            print(f"[DEBUG] 尝试连接设备 {ip}...")
+
+        channel = create_channel(ip, username, password)
+        if not channel:
+            with file_lock:  # 线程安全写入失败记录
+                fail_log.write(f"{ip}\n")
+                fail_log.flush()
+                # 为所有命令写入连接失败记录
+                for cmd in commands:
+                    writer.writerow([ip, cmd, "连接失败"])
+            with print_lock:
+                print(f"[ERROR] 设备 {ip} 连接失败")
+            return
+
+        with print_lock:
+            print(f"[SUCCESS] 设备 {ip} 连接成功")
+
+        try:
+            # 设置屏幕长度避免分页
+            with print_lock:
+                print(f"[DEBUG] 设备 {ip} 设置 screen-length 512...")
+            execute_some_command(channel, "screen-length 512", 1)
+
+            # 执行所有自定义命令
+            for cmd_idx, cmd in enumerate(commands):
+                try:
+                    with print_lock:
+                        print(f"[COMMAND] 设备 {ip} 执行命令 ({cmd_idx+1}/{len(commands)}): {cmd}")
+                    
+                    output = execute_some_command(channel, cmd, 3)
+
+                    # 清理输出内容
+                    clean_output = "\n".join([
+                        line.strip()
+                        for line in output.split('\n')
+                        if line.strip() and line.strip() != cmd
+                    ])
+
+                    with print_lock:
+                        print(f"[OUTPUT] 设备 {ip} 命令 {cmd} 输出长度: {len(clean_output)} 字符")
+
+                    with file_lock:  # 线程安全写入
+                        writer.writerow([ip, cmd, clean_output])
+
+                    with print_lock:
+                        print(f"[DEBUG] 设备 {ip} 命令 {cmd} 处理完成")
+
+                except Exception as single_cmd_error:
+                    error_msg = f"命令执行失败: {str(single_cmd_error)}"
+                    with print_lock:
+                        print(f"[ERROR] 设备 {ip} 命令 '{cmd}' 执行异常: {str(single_cmd_error)}")
+                    with file_lock:
+                        writer.writerow([ip, cmd, error_msg])
+
+            # 恢复屏幕长度设置
+            try:
+                with print_lock:
+                    print(f"[DEBUG] 设备 {ip} 恢复 screen-length 25...")
+                execute_some_command(channel, "screen-length 25", 1)
+            except Exception as restore_error:
+                with print_lock:
+                    print(f"[WARNING] 设备 {ip} 恢复屏幕长度设置失败: {restore_error}")
+
+        except Exception as cmd_error:
+            with print_lock:
+                print(f"[ERROR] 设备 {ip} 命令执行全局异常: {str(cmd_error)}")
+            with file_lock:
+                fail_log.write(f"{ip} - {str(cmd_error)}\n")
+                fail_log.flush()
+                # 为所有命令写入错误记录
+                for cmd in commands:
+                    error_msg = f"执行失败: {str(cmd_error)}"
+                    writer.writerow([ip, cmd, error_msg])
+
+    except Exception as connection_error:
+        with print_lock:
+            print(f"[ERROR] 设备 {ip} 连接异常: {str(connection_error)}")
+        with file_lock:
+            fail_log.write(f"{ip} - {str(connection_error)}\n")
+            fail_log.flush()
+            # 为所有命令写入连接异常记录
+            for cmd in commands:
+                error_msg = f"连接异常: {str(connection_error)}"
+                writer.writerow([ip, cmd, error_msg])
+
+    finally:
+        # 确保连接被正确关闭
+        if channel:
+            try:
+                with print_lock:
+                    print(f"[DEBUG] 设备 {ip} 尝试关闭连接")
+                channel.close()
+                with print_lock:
+                    print(f"[DEBUG] 设备 {ip} 连接已关闭")
+            except Exception as close_error:
+                with print_lock:
+                    print(f"[WARNING] 关闭设备 {ip} 连接时出错: {close_error}")
 
 
 def generate_custom_cmd_report(raw_file, report_file, host_file):
@@ -3816,56 +3870,68 @@ def process_device_info(ip, user, pwd, commands, writer, fail_log):
     from collections import defaultdict
     from threading import Lock
 
-    # 文件写入锁，确保线程安全
+    # 文件写入锁和打印锁，确保线程安全
     file_lock = Lock()
+    print_lock = Lock()  # 添加打印锁
     channel = None
+    
     try:
-        print(f"\n[DEBUG] {'='*40}")
-        print(f"[DEBUG] 开始处理设备: {ip}")
-        print(f"[DEBUG] 尝试连接设备 {ip}...")
+        with print_lock:
+            print(f"\n[DEBUG] {'='*40}")
+            print(f"[DEBUG] 开始处理设备: {ip}")
+            print(f"[DEBUG] 尝试连接设备 {ip}...")
+            
         channel = create_channel(ip, user, pwd)
         if not channel:
-            with file_lock:  # 线程安全写入失败记录
+            with file_lock:
                 fail_log.write(ip + '\n')
-            print(f"[ERROR] 设备 {ip} 连接失败")
+            with print_lock:
+                print(f"[ERROR] 设备 {ip} 连接失败")
             return
 
-        print(f"[SUCCESS] 设备 {ip} 连接成功")
-        print(f"[DEBUG] 设置 screen-length 512...")
+        with print_lock:
+            print(f"[SUCCESS] 设备 {ip} 连接成功")
+            print(f"[DEBUG] 设置 screen-length 512...")
         execute_some_command(channel, "screen-length 512", 1)
 
         for cmd in commands:
-            print(f"[COMMAND] 执行命令: {cmd}")
+            with print_lock:
+                print(f"[COMMAND] 执行命令: {cmd}")
             output = execute_some_command(channel, cmd, 5)
-            print(f"[OUTPUT] 命令 {cmd} 输出长度: {len(output)} 字符")
+            with print_lock:
+                print(f"[OUTPUT] 命令 {cmd} 输出长度: {len(output)} 字符")
 
             clean_output = "\n".join([
                 line.strip()
                 for line in output.split('\n')
                 if line.strip() and line.strip() != cmd
             ])
-            with file_lock:  # 线程安全写入
+            with file_lock:
                 writer.writerow([ip, cmd, clean_output])
-            print(f"[DEBUG] 命令 {cmd} 处理完成")
+            with print_lock:
+                print(f"[DEBUG] 命令 {cmd} 处理完成")
 
-        print(f"[DEBUG] 恢复 screen-length 25...")
+        with print_lock:
+            print(f"[DEBUG] 恢复 screen-length 25...")
         execute_some_command(channel, "screen-length 25", 1)
 
     except Exception as cmd_error:
-        print(f"{Fore.YELLOW}⚠️ 设备 {ip} 执行命令失败: {cmd_error}{Style.RESET_ALL}")
-        with file_lock:  # 线程安全写入失败记录
+        with print_lock:
+            print(f"{Fore.YELLOW}⚠️ 设备 {ip} 执行命令失败: {cmd_error}{Style.RESET_ALL}")
+        with file_lock:
             fail_log.write(ip + '\n')
             for cmd in commands:
-                with file_lock:
-                    writer.writerow([ip, cmd, f"执行失败: {cmd_error}"])
+                writer.writerow([ip, cmd, f"执行失败: {cmd_error}"])
     finally:
         if channel:
             try:
                 channel.close()
-                print(f"[DEBUG] 设备 {ip} 连接已关闭")
+                with print_lock:
+                    print(f"[DEBUG] 设备 {ip} 连接已关闭")
             except Exception as close_error:
-                print(
-                    f"{Fore.YELLOW}⚠️ 关闭 {ip} 连接时出错: {close_error}{Style.RESET_ALL}")
+                with print_lock:
+                    print(f"{Fore.YELLOW}⚠️ 关闭 {ip} 连接时出错: {close_error}{Style.RESET_ALL}")
+
 
 
 def generate_device_info_report(raw_file, report_file, host_file):
@@ -5482,13 +5548,6 @@ def generate_time_sync_report(raw_file, report_file, host_file):
 
 def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
     """Collect data for multiple commands from devices with debug output."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from tqdm import tqdm
-    from colorama import Fore, Style
-    import csv
-    import threading
-    import time
-
     print(
         f"{Fore.CYAN}[START] 开始采集QA巡检数据，输入文件: {host_file}, 输出文件: {raw_file}, 命令: {commands}{Style.RESET_ALL}")
 
@@ -5503,20 +5562,71 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
                 print(
                     f"{Fore.GREEN}[INFO] 共发现 {total_devices} 台设备{Style.RESET_ALL}")
 
-                # Initialize progress bar
+                # 获取终端宽度
+                terminal_width = shutil.get_terminal_size().columns
+
+                # 设置 tqdm 进度条，留出 20 个字符空间给其他信息
                 bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
                 pbar = tqdm(total=total_devices, desc="🔍 QA巡检数据采集进度", unit="台",
-                            bar_format=bar_format, colour='green')
+                            bar_format=bar_format, colour='green', ncols=terminal_width - 20)
 
-                # Function to periodically update progress bar and print progress
+                # 初始化完成计数和锁
+                completed_count = 0
+                progress_lock = threading.Lock()
+                stop_periodic_update = threading.Event()
+
+                # 定义开始时间
+                start_time = time.time()
+
+                # 定期更新进度条的函数
                 def periodic_update():
-                    while not pbar.disable:
-                        pbar.refresh()
-                        print(
-                            f"{Fore.BLUE}[PROGRESS] 当前进度: {pbar.n}/{pbar.total} 台设备完成{Style.RESET_ALL}")
-                        time.sleep(6)
+                    nonlocal completed_count
+                    while not stop_periodic_update.is_set():
+                        try:
+                            with progress_lock:
+                                current_count = completed_count
 
-                # Start periodic update in a separate thread
+                            current_time = time.time()
+                            elapsed_time = current_time - start_time
+
+                            # 设置手动进度条长度，留出 79 个字符空间给其他文本
+                            progress_bar_length = terminal_width - 79
+                            progress_bar = "█" * \
+                                int(current_count / total_devices *
+                                    progress_bar_length)
+                            progress_bar += "░" * \
+                                (progress_bar_length - len(progress_bar))
+
+                            # 每 5 秒打印一次进度信息
+                            eta_info = ""
+                            if current_count > 0:
+                                avg_time_per_device = elapsed_time / current_count
+                                remaining_devices = total_devices - current_count
+                                estimated_remaining_time = avg_time_per_device * remaining_devices
+                                total_minutes = estimated_remaining_time / 60
+                                if total_minutes < 60:
+                                    eta_info = f" | 预计耗时: {total_minutes:.1f}分钟"
+                                else:
+                                    hours = int(total_minutes // 60)
+                                    minutes = int(total_minutes % 60)
+                                    eta_info = f" | 预计耗时: {hours}小时{minutes}分钟"
+
+                            print(
+                                f"{Fore.BLUE}[PROGRESS] [{progress_bar}] {current_count}/{total_devices} "
+                                f"({current_count/total_devices*100:.1f}%) | "
+                                f"已用时: {elapsed_time:.0f}秒 | 剩余:{total_devices - current_count}台{eta_info}{Style.RESET_ALL}")
+
+                            # 如果任务完成，退出循环
+                            if current_count >= total_devices:
+                                break
+
+                        except Exception as e:
+                            print(
+                                f"{Fore.YELLOW}[WARNING] 进度更新出错: {e}{Style.RESET_ALL}")
+
+                        stop_periodic_update.wait(5)
+
+                # 在单独线程中启动定期更新
                 update_thread = threading.Thread(
                     target=periodic_update, daemon=True)
                 update_thread.start()
@@ -5530,16 +5640,47 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
                         futures.append(executor.submit(
                             process_multiple_cmds_device, ip, user, pwd, commands, writer, fail_log))
 
+                    # 更新完成计数的函数
+                    def update_completed_count():
+                        nonlocal completed_count
+                        completed_count += 1
+                        return completed_count
+
                     try:
                         for future in as_completed(futures):
                             try:
-                                future.result()
+                                result = future.result()
+                                with progress_lock:
+                                    current_completed = update_completed_count()
+
+                                pbar.update(1)
+
+                                # 立即打印当前完成的设备
+                                # if result:
+                                #     current_time = time.time()
+                                #     elapsed_time = current_time - start_time
+                                #     progress_bar_length = terminal_width - 80
+                                #     progress_bar = "█" * int(current_completed / total_devices * progress_bar_length)
+                                #     progress_bar += "░" * (progress_bar_length - len(progress_bar))
+
+                                #     print(f"{Fore.GREEN}[COMPLETED] 设备 {result} 处理完成 | "
+                                #           f"进度: [{progress_bar}] {current_completed}/{total_devices} "
+                                #           f"({current_completed/total_devices*50:.1f}%) | "
+                                #           f"已用时: {elapsed_time:.0f}秒{Style.RESET_ALL}")
+
                             except Exception as e:
+                                with progress_lock:
+                                    current_completed = update_completed_count()
+                                pbar.update(1)
                                 print(
                                     f"{Fore.RED}[ERROR] 线程执行出错: {str(e)}{Style.RESET_ALL}")
-                            pbar.update(1)
+
                     finally:
-                        pbar.close()  # Ensure progress bar is properly closed
+                        stop_periodic_update.set()
+                        pbar.close()
+
+                        if update_thread.is_alive():
+                            update_thread.join(timeout=2)
 
         except Exception as e:
             print(f"{Fore.RED}[ERROR] 数据采集错误: {str(e)}{Style.RESET_ALL}")
@@ -7607,8 +7748,8 @@ def parse_ldp_l2vc_detail(ldp_detail_output):
         line = line.strip()
 
         # 打印前50行的调试信息以便观察
-        if i < 50:
-            print(f"Debug: 行{i}: '{original_line}' -> '{line}'")
+        # if i < 50:
+        #     print(f"Debug: 行{i}: '{original_line}' -> '{line}'")
 
         # 匹配VCID行 - 格式: vcid: 105, type: ethernet, ...
         if line.startswith('vcid:'):
@@ -7989,10 +8130,14 @@ def parse_main_backup_version(output):
 
     for i, line in enumerate(lines):
         line = line.strip()
+
+        # 提取设备名称
         if line.startswith('<') and line.endswith('>'):
             device_name = line[1:-1]
             print(
                 f"{Fore.YELLOW}[DEBUG] 提取设备名称: {device_name}{Style.RESET_ALL}")
+
+        # 提取网元类型
         if "stn-standard-reserved" in line:
             if i + 1 < len(lines):
                 ne_type_full = lines[i + 1].strip()
@@ -8000,8 +8145,14 @@ def parse_main_backup_version(output):
                 ) if ',' in ne_type_full else ne_type_full
                 print(
                     f"{Fore.YELLOW}[DEBUG] 提取网元类型: {ne_type}{Style.RESET_ALL}")
+
+        # 解析系统信息 - 改进的解析逻辑
         if line.startswith('system info'):
             system_info = line.split(':', 1)[1].strip()
+            print(
+                f"{Fore.BLUE}[DEBUG] 原始系统信息: '{system_info}'{Style.RESET_ALL}")
+
+            # 尝试匹配标准格式: O123456789 (123456789)
             match = re.search(r'O(\d+)\s*\((\d+)\)', system_info)
             if match:
                 main_version, backup_version = match.groups()
@@ -8010,16 +8161,45 @@ def parse_main_backup_version(output):
                 else:
                     result = "error"
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 提取系统信息: 主用={main_version}, 备用={backup_version}, Result={result}{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 标准格式匹配: 主用={main_version}, 备用={backup_version}, Result={result}{Style.RESET_ALL}")
+            else:
+                # 尝试匹配异常格式: O123456789uptime: 或其他变体
+                alt_match = re.search(r'O(\d+)(?:uptime:|$)', system_info)
+                if alt_match:
+                    version_number = alt_match.group(1)
+                    main_version = version_number
+                    backup_version = version_number  # 假设主备版本相同
+                    result = "normal"  # 由于只有一个版本号，假设一致
+                    print(
+                        f"{Fore.YELLOW}[DEBUG] 异常格式匹配: 版本={version_number}, 假设主备一致, Result={result}{Style.RESET_ALL}")
+                else:
+                    # 尝试提取任何数字序列
+                    number_match = re.search(r'O?(\d+)', system_info)
+                    if number_match:
+                        version_number = number_match.group(1)
+                        main_version = version_number
+                        backup_version = "-"  # 无法确定备用版本
+                        result = "error"  # 无法确定版本一致性
+                        print(
+                            f"{Fore.RED}[DEBUG] 部分匹配: 主用={version_number}, 备用=未知, Result={result}{Style.RESET_ALL}")
+                    else:
+                        print(
+                            f"{Fore.RED}[DEBUG] 无法解析系统信息: '{system_info}'{Style.RESET_ALL}")
 
+    # 设置默认值
     if not ne_type:
         ne_type = "-"
     if not device_name:
         device_name = "-"
     if not main_version or not backup_version:
-        main_version = "-"
-        backup_version = "-"
-        result = "error"
+        if not main_version:
+            main_version = "-"
+        if not backup_version:
+            backup_version = "-"
+        if main_version == "-" or backup_version == "-":
+            result = "error"
+
+    print(f"{Fore.GREEN}[DEBUG] 最终结果: NE类型={ne_type}, 设备名={device_name}, 主用={main_version}, 备用={backup_version}, 状态={result}{Style.RESET_ALL}")
 
     return (ne_type, device_name, main_version, backup_version, result)
 
@@ -8453,12 +8633,12 @@ def parse_optical_module(ip, interface_output, lldp_output, parse_uptime_func):
             tx_min, tx_max = extract_range_values(
                 tx_alarm_range if tx_alarm_range != "-" else tx_range)
 
-            if tx_min is not None and tx_max is not None and (tx_power < tx_min or tx_power > tx_max):
+            if tx_min is not None and tx_power < tx_min:
                 result = "error"
                 error_reasons.append(
-                    f"Tx光功率超出范围: {tx_power}dBm 范围: {tx_min}~{tx_max}dBm")
+                    f"Tx光功率低于范围: {tx_power}dBm 最小值: {tx_min}dBm")
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Tx光功率异常: {tx_power}dBm 范围: {tx_min}~{tx_max}dBm{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 设备 {ip} 接口 {interface} Tx光功率过低: {tx_power}dBm 最小值: {tx_min}dBm{Style.RESET_ALL}")
         except (ValueError, TypeError):
             print(
                 f"{Fore.YELLOW}[WARNING] 设备 {ip} 接口 {interface} Tx光功率解析失败: {data['tx_power']}{Style.RESET_ALL}")
@@ -9004,11 +9184,19 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
         retry_count: 连接重试次数
         cmd_interval: 命令之间的间隔时间(秒)
     """
+    from threading import Lock
+    from datetime import datetime
+    import time
+    import logging
+    from colorama import Fore, Style
+
     file_lock = Lock()
+    print_lock = Lock()
     channel = None
 
     try:
-        print(f"[INFO] 处理设备: {ip}")
+        with print_lock:
+            print(f"[INFO] 开始处理设备: {ip}")
         logging.info(f"开始处理设备: {ip}")
 
         # 创建SSH通道，增加重试和超时配置
@@ -9019,22 +9207,20 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
             with file_lock:
                 fail_log.write(
                     f"{ip},连接失败,{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            print(f"[ERROR] 设备 {ip} 连接失败")
+            with print_lock:
+                print(f"[ERROR] 设备 {ip} 连接失败")
             return None
 
         # 设置终端不分页显示（优先尝试screen-length 0）
-        # 添加更长的延迟用于设备初始化和配置变更
-        time.sleep(1)  # 在设置终端特性前等待
+        time.sleep(1)
 
         result = execute_some_command(
             channel, "screen-length 0", timeout=2, max_retries=3, command_delay=1)
         if "Error" in result or "ERROR: Invalid input detected at '^' marker" in result:
-            # 尝试备用方案
-            time.sleep(1)  # 在尝试备用命令前等待
+            time.sleep(1)
             execute_some_command(
                 channel, "screen-length 512", timeout=2, max_retries=3, command_delay=1)
 
-        # 在开始执行命令前先等待设备稳定
         time.sleep(1)
 
         for i, cmd in enumerate(commands):
@@ -9046,23 +9232,20 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
             if i > 0:
                 with print_lock:
                     print(f"[INFO] 等待 {cmd_interval} 秒后执行下一命令...")
-                time.sleep(cmd_interval)  # 命令之间添加延迟
+                time.sleep(cmd_interval)
 
             # 在执行命令前记录PC时间
             pc_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            # 执行命令，依赖 execute_some_command 的内置重试机制
-            # 增加命令延迟参数
+            # 执行命令
             output = execute_some_command(
-                channel, cmd, timeout=10, max_retries=3, command_delay=1.5)
+                channel, cmd, timeout=10, max_retries=3, command_delay=1.5, device_name=ip, ip=ip)
 
             # 检查输出是否包含错误
             if "ERROR" in output or "ERROR: Invalid input detected at '^' marker" in output:
                 with print_lock:
-                    print(
-                        f"[WARNING] 命令 {cmd} 于设备 {ip} 执行失败: {output[:500]}...")
+                    print(f"[WARNING] 命令 {cmd} 于设备 {ip} 执行失败: {output[:500]}...")
                 logging.warning(f"命令 {cmd} 于设备 {ip} 执行失败")
-                # 命令执行失败后添加额外延迟，防止设备过载
                 time.sleep(3)
 
             # 清理输出内容
@@ -9073,10 +9256,10 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
                 not line.strip().startswith(cmd)
             ])
 
-            # 将PC时间附加到输出中，便于清洗时使用
+            # 将PC时间附加到输出中
             clean_output_with_time = f"PC_TIME: {pc_time}\n{clean_output}"
 
-            # 输出前500个字符用于调试
+            # 输出前800个字符用于调试
             output_preview = clean_output[:800] + \
                 "..." if len(clean_output) > 800 else clean_output
             with print_lock:
@@ -9092,14 +9275,16 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
                         print(f"[ERROR] 写入结果到CSV时出错: {write_err}")
 
     except ValueError as auth_error:
-        print(f"[WARNING] 设备 {ip} 认证失败: {auth_error}")
+        with print_lock:
+            print(f"[WARNING] 设备 {ip} 认证失败: {auth_error}")
         logging.warning(f"设备 {ip} 认证失败: {auth_error}")
         with file_lock:
             fail_log.write(
                 f"{ip},用户名或密码错误,{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     except Exception as cmd_error:
-        print(f"[WARNING] 设备 {ip} 执行命令失败: {cmd_error}")
+        with print_lock:
+            print(f"[WARNING] 设备 {ip} 执行命令失败: {cmd_error}")
         logging.error(f"设备 {ip} 执行命令失败: {cmd_error}")
         with file_lock:
             fail_log.write(
@@ -9108,24 +9293,26 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
     finally:
         if channel:
             try:
-                # 无论是否异常，最终都尝试恢复默认分页设置
-                time.sleep(2)  # 等待一段时间后再恢复设置
+                time.sleep(2)
                 execute_some_command(
                     channel, "screen-length 25", timeout=2, max_retries=3, command_delay=1)
             except Exception as restore_error:
-                print(f"[WARNING] 恢复终端设置失败: {restore_error}")
+                with print_lock:
+                    print(f"[WARNING] 恢复终端设置失败: {restore_error}")
                 logging.warning(f"设备 {ip} 恢复终端设置失败: {restore_error}")
             finally:
                 try:
-                    # 在关闭连接前等待，确保所有命令已完成处理
                     time.sleep(2)
                     channel.close()
                 except Exception as close_error:
-                    print(f"[WARNING] 关闭 {ip} 连接时出错: {close_error}")
+                    with print_lock:
+                        print(f"[WARNING] 关闭 {ip} 连接时出错: {close_error}")
                     logging.warning(f"关闭 {ip} 连接时出错: {close_error}")
 
         logging.info(f"设备 {ip} 处理完成")
-        return ip  # 确保返回IP，以便主函数跟踪任务完成情况
+        with print_lock:
+            print(f"[INFO] 设备 {ip} 指令处理完成")
+        return ip
 
 
 def parse_uptime(output):
@@ -9518,6 +9705,9 @@ def create_device_panel_layout(ws, devices_data):
     dark_green_fill = PatternFill(
         start_color="FF00B050", end_color="FF00B050", fill_type="solid")  # 深绿色
     center_alignment = Alignment(horizontal="center", vertical="center")
+    # 添加支持换行的对齐方式
+    center_alignment_wrap = Alignment(
+        horizontal="center", vertical="center", wrap_text=True)
     thin_border = Border(
         left=Side(style='thin'), right=Side(style='thin'),
         top=Side(style='thin'), bottom=Side(style='thin')
@@ -9601,14 +9791,20 @@ def fill_a2_device_panel(ws, device_data, start_row, green_fill):
     # A列 - 槽位11 (6行合并)
     ws.merge_cells(f'A{start_row}:A{start_row + 5}')
 
-    # 填充槽位11内容 - 修复风扇显示格式
+    # 填充槽位11内容 - 修复风扇显示格式，添加换行支持
     slot_11_info = slots.get(11, {})
     slot_11_name = slot_11_info.get('card_name', '')
     if slot_11_name and 'FAN' in slot_11_name.upper():
         # 风扇槽位显示为"FAN\n11"格式
-        ws.cell(row=start_row, column=1).value = f"FAN\n11"
+        cell = ws.cell(row=start_row, column=1)
+        cell.value = f"FAN\n11"
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
     else:
-        ws.cell(row=start_row, column=1).value = slot_11_name if slot_11_name else ""
+        cell = ws.cell(row=start_row, column=1)
+        cell.value = slot_11_name if slot_11_name else ""
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
 
     # 如果有任何板卡，则整个A列都填充颜色
     if has_any_card:
@@ -9622,20 +9818,22 @@ def fill_a2_device_panel(ws, device_data, start_row, green_fill):
 
     # 如果有任何板卡，电源槽位也填充颜色
     if has_any_card:
-        # 槽位13电源 - 修复显示格式和对齐
-        ws.cell(row=start_row, column=2).value = "PWR\n13"
-        ws.cell(row=start_row, column=2).fill = green_fill
-        ws.cell(row=start_row, column=2).alignment = Alignment(
-            horizontal="center", vertical="center")
+        # 槽位13电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row, column=2)
+        cell.value = "PWR\n13"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
 
         # 空白区域也填充颜色
         ws.cell(row=start_row + 2, column=2).fill = green_fill
 
-        # 槽位12电源 - 修复显示格式和对齐
-        ws.cell(row=start_row + 4, column=2).value = "PWR\n12"
-        ws.cell(row=start_row + 4, column=2).fill = green_fill
-        ws.cell(row=start_row + 4, column=2).alignment = Alignment(
-            horizontal="center", vertical="center")
+        # 槽位12电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row + 4, column=2)
+        cell.value = "PWR\n12"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
 
     # C和D列的槽位布局
     slot_layout = [
@@ -9676,7 +9874,10 @@ def fill_a2_device_panel(ws, device_data, start_row, green_fill):
             else:
                 content = f"{card_name}     ·{slot_num}"
 
-            ws.cell(row=start_row + row_offset, column=col).value = content
+            cell = ws.cell(row=start_row + row_offset, column=col)
+            cell.value = content
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
 
     # E列 - 备注信息
     ws.cell(row=start_row, column=5).value = device_data.get('device_name', '')
@@ -9698,8 +9899,11 @@ def fill_a1_device_panel(ws, device_data, start_row, green_fill):
         if slot_info.get('card_name'):
             # A1设备的槽位内容固定为"S10_04"
             content = "S10_04"
-            ws.cell(row=start_row, column=col).value = content
-            ws.cell(row=start_row, column=col).fill = green_fill
+            cell = ws.cell(row=start_row, column=col)
+            cell.value = content
+            cell.fill = green_fill
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
 
     # K列 - 备注信息
     ws.cell(row=start_row, column=11).value = device_data.get('device_name', '')
@@ -9720,14 +9924,20 @@ def fill_a3_device_panel(ws, device_data, start_row, green_fill):
     # M列 - 槽位11 (6行合并)
     ws.merge_cells(f'M{start_row}:M{start_row + 5}')
 
-    # 填充槽位11内容 - 修复风扇显示格式
+    # 填充槽位11内容 - 修复风扇显示格式，添加换行支持
     slot_11_info = slots.get(11, {})
     slot_11_name = slot_11_info.get('card_name', '')
     if slot_11_name and 'FAN' in slot_11_name.upper():
         # 风扇槽位显示为"FAN\n11"格式
-        ws.cell(row=start_row, column=13).value = f"FAN\n11"
+        cell = ws.cell(row=start_row, column=13)
+        cell.value = f"FAN\n11"
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
     else:
-        ws.cell(row=start_row, column=13).value = slot_11_name if slot_11_name else ""
+        cell = ws.cell(row=start_row, column=13)
+        cell.value = slot_11_name if slot_11_name else ""
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
 
     # 如果有任何板卡，则整个M列都填充颜色
     if has_any_card:
@@ -9741,20 +9951,22 @@ def fill_a3_device_panel(ws, device_data, start_row, green_fill):
 
     # 如果有任何板卡，电源槽位也填充颜色
     if has_any_card:
-        # 槽位13电源 - 修复显示格式和对齐
-        ws.cell(row=start_row, column=14).value = "PWR\n13"
-        ws.cell(row=start_row, column=14).fill = green_fill
-        ws.cell(row=start_row, column=14).alignment = Alignment(
-            horizontal="center", vertical="center")
+        # 槽位13电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row, column=14)
+        cell.value = "PWR\n13"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
 
         # 空白区域也填充颜色
         ws.cell(row=start_row + 2, column=14).fill = green_fill
 
-        # 槽位12电源 - 修复显示格式和对齐
-        ws.cell(row=start_row + 4, column=14).value = "PWR\n12"
-        ws.cell(row=start_row + 4, column=14).fill = green_fill
-        ws.cell(row=start_row + 4, column=14).alignment = Alignment(
-            horizontal="center", vertical="center")
+        # 槽位12电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row + 4, column=14)
+        cell.value = "PWR\n12"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
 
     # O和P列的槽位布局 (类似C和D列，但使用列15和16)
     slot_layout = [
@@ -9794,7 +10006,10 @@ def fill_a3_device_panel(ws, device_data, start_row, green_fill):
             else:
                 content = f"{card_name}     ·{slot_num}"
 
-            ws.cell(row=start_row + row_offset, column=col).value = content
+            cell = ws.cell(row=start_row + row_offset, column=col)
+            cell.value = content
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
 
     # Q列 - 备注信息
     ws.cell(row=start_row, column=17).value = device_data.get('device_name', '')
@@ -9802,7 +10017,21 @@ def fill_a3_device_panel(ws, device_data, start_row, green_fill):
     ws.cell(row=start_row + 2, column=17).value = device_data.get('device_model', '')
 
 
-# 在主函数中调用自适应列宽的部分需要修改
+def calculate_chinese_width(text):
+    """计算包含中文字符的文本显示宽度"""
+    if not text:
+        return 0
+
+    width = 0
+    for char in str(text):
+        # 中文字符和全角字符占用2个字符宽度
+        if ord(char) > 127:  # 非ASCII字符
+            width += 2
+        else:
+            width += 1
+    return width
+
+
 def apply_autofit_to_all_sheets(wb):
     """对所有工作表应用自适应列宽"""
     for sheet_name in wb.sheetnames:
@@ -9900,10 +10129,13 @@ def parse_device_panel(device_output, ne_type, ne_name, ne_ip):
 
     return result_data
 
-#接口描述
+# 接口描述
+
+
 def add_interface_description_cmd(host_file, raw_file, report_file, max_workers=40):
     """添加互联端口描述并生成报告 (Add Interface Description and Generate Report)"""
-    print(f"[START] 开始添加互联端口描述，输入文件: {host_file}, 输出文件: {raw_file}, 报告文件: {report_file}")
+    print(
+        f"[START] 开始添加互联端口描述，输入文件: {host_file}, 输出文件: {raw_file}, 报告文件: {report_file}")
 
     # 清空旧的failure_ips.tmp文件
     if os.path.exists("failure_ips.tmp"):
@@ -9943,9 +10175,11 @@ def add_interface_description_cmd(host_file, raw_file, report_file, max_workers=
                             try:
                                 future.result(timeout=120)  # 每个任务最多120秒
                             except TimeoutError:
-                                print(f"{Fore.RED}设备 {ip_to_future[future]} 任务超时{Style.RESET_ALL}")
+                                print(
+                                    f"{Fore.RED}设备 {ip_to_future[future]} 任务超时{Style.RESET_ALL}")
                             except Exception as e:
-                                print(f"{Fore.RED}设备 {ip_to_future[future]} 线程执行出错: {str(e)}{Style.RESET_ALL}")
+                                print(
+                                    f"{Fore.RED}设备 {ip_to_future[future]} 线程执行出错: {str(e)}{Style.RESET_ALL}")
                             pbar.update(1)
 
         except Exception as e:
@@ -9954,6 +10188,7 @@ def add_interface_description_cmd(host_file, raw_file, report_file, max_workers=
     print(f"[INFO] 开始生成接口描述配置报告...")
     generate_interface_description_report(raw_file, report_file, host_file)
     print(f"[END] 接口描述配置及报告生成完成")
+
 
 def parse_ospf_dot31_interfaces(ospf_output):
     """解析OSPF邻居输出，提取所有.31接口（包括万兆接口）"""
@@ -9964,7 +10199,8 @@ def parse_ospf_dot31_interfaces(ospf_output):
             if '.31' in line:
                 # 匹配gigabitethernet和xgigabitethernet接口
                 # 支持格式: gigabitethernet 0/1/1.31 或 xgigabitethernet 0/4/4.31
-                match = re.search(r'(x?gigabitethernet\s+\d+/\d+/\d+\.31)', line, re.IGNORECASE)
+                match = re.search(
+                    r'(x?gigabitethernet\s+\d+/\d+/\d+\.31)', line, re.IGNORECASE)
                 if match:
                     interface = match.group(1).replace(' ', ' ')  # 保持原格式
                     interfaces.add(interface)
@@ -9981,27 +10217,28 @@ def parse_lldp_neighbors(lldp_output):
         lines = lldp_output.split('\n')
         current_interface = None
         current_neighbor = {}
-        
+
         for line in lines:
             line = line.strip()
-            
+
             # 检测接口行，支持gigabitethernet和xgigabitethernet
             # 格式: Interface 'gigabitethernet 0/1/2' has 1 LLDP Neighbors:
             # 或: Interface 'xgigabitethernet 0/4/4' has 1 LLDP Neighbors:
             if ("Interface 'gigabitethernet" in line or "Interface 'xgigabitethernet" in line) and "has" in line and "LLDP Neighbors:" in line:
                 # 提取物理接口名称
-                interface_match = re.search(r"Interface '(x?gigabitethernet\s+\d+/\d+/\d+)'", line)
+                interface_match = re.search(
+                    r"Interface '(x?gigabitethernet\s+\d+/\d+/\d+)'", line)
                 if interface_match:
                     current_interface = interface_match.group(1)
                     current_neighbor = {}
                     print(f"[DEBUG] 发现LLDP接口: {current_interface}")
-            
+
             # 解析系统名称
             elif line.startswith("System Name:") and current_interface:
                 system_name = line.replace("System Name:", "").strip()
                 current_neighbor['system_name'] = system_name
                 print(f"[DEBUG] 系统名称: {system_name}")
-            
+
             # 解析端口ID
             elif line.startswith("Port ID:") and current_interface:
                 port_match = re.search(r"Interface Name - (.+)", line)
@@ -10009,15 +10246,16 @@ def parse_lldp_neighbors(lldp_output):
                     port_id = port_match.group(1).strip()
                     current_neighbor['port_id'] = port_id
                     print(f"[DEBUG] 端口ID: {port_id}")
-            
+
             # 检测LLDPDU结束，保存当前邻居信息
             elif line.startswith("End Of LLDPDU:") and current_interface and current_neighbor:
                 if 'system_name' in current_neighbor and 'port_id' in current_neighbor:
                     neighbors[current_interface] = current_neighbor.copy()
-                    print(f"[DEBUG] 保存LLDP邻居: {current_interface} -> {current_neighbor}")
+                    print(
+                        f"[DEBUG] 保存LLDP邻居: {current_interface} -> {current_neighbor}")
                 current_interface = None
                 current_neighbor = {}
-        
+
         print(f"[DEBUG] 解析LLDP邻居结果: {neighbors}")
     except Exception as e:
         print(f"[ERROR] 解析LLDP邻居失败: {e}")
@@ -10043,7 +10281,8 @@ def process_device_interface_description(ip, user, pwd, writer, fail_log, file_l
         con_cmd = "con"
         con_output = execute_some_command(channel, con_cmd, 3)
         print(f"[DEBUG] 设备 {ip} con 输出: {con_output[:200]}...")
-        commands_executed = [(con_cmd, con_output, "执行成功" if "error" not in con_output.lower() else "执行失败")]
+        commands_executed = [
+            (con_cmd, con_output, "执行成功" if "error" not in con_output.lower() else "执行失败")]
 
         # 获取OSPF邻居信息
         ospf_cmd = "show ospf neighbor brief"
@@ -10060,7 +10299,7 @@ def process_device_interface_description(ip, user, pwd, writer, fail_log, file_l
         # 解析OSPF和LLDP信息，找到需要配置的接口
         ospf_interfaces = parse_ospf_dot31_interfaces(ospf_output)
         lldp_neighbors = parse_lldp_neighbors(lldp_output)
-        
+
         print(f"[DEBUG] 设备 {ip} 发现OSPF .31接口: {ospf_interfaces}")
         print(f"[DEBUG] 设备 {ip} 发现LLDP邻居接口: {list(lldp_neighbors.keys())}")
 
@@ -10069,49 +10308,58 @@ def process_device_interface_description(ip, user, pwd, writer, fail_log, file_l
         for physical_interface, neighbor_info in lldp_neighbors.items():
             # 构造对应的.31接口名称
             dot31_interface = f"{physical_interface}.31"
-            
+
             # 检查这个.31接口是否在OSPF中
             if dot31_interface in ospf_interfaces:
                 # 构建描述信息：对端设备名称-对端设备端口.31
                 description = f"{neighbor_info['system_name']}-{neighbor_info['port_id']}.31"
-                
-                print(f"[INFO] 设备 {ip} 准备配置接口 {dot31_interface} 描述: {description}")
-                
+
+                print(
+                    f"[INFO] 设备 {ip} 准备配置接口 {dot31_interface} 描述: {description}")
+
                 # 进入接口配置模式
                 interface_cmd = f"inter {dot31_interface}"
-                interface_output = execute_some_command(channel, interface_cmd, 2)
-                commands_executed.append((interface_cmd, interface_output, "进入接口"))
-                
+                interface_output = execute_some_command(
+                    channel, interface_cmd, 2)
+                commands_executed.append(
+                    (interface_cmd, interface_output, "进入接口"))
+
                 # 先执行desc命令（可选，用于清空当前描述）
                 desc_cmd = "desc"
                 desc_output = execute_some_command(channel, desc_cmd, 1)
                 commands_executed.append((desc_cmd, desc_output, "清空描述"))
-                
+
                 # 配置新描述
                 description_cmd = f"description {description}"
-                description_output = execute_some_command(channel, description_cmd, 2)
-                commands_executed.append((description_cmd, description_output, "配置描述"))
-                print(f"[INFO] 设备 {ip} 接口 {dot31_interface} 配置描述成功: {description}")
-                
+                description_output = execute_some_command(
+                    channel, description_cmd, 2)
+                commands_executed.append(
+                    (description_cmd, description_output, "配置描述"))
+                print(
+                    f"[INFO] 设备 {ip} 接口 {dot31_interface} 配置描述成功: {description}")
+
                 # 退出接口配置模式
                 quit_cmd = "q"
                 quit_output = execute_some_command(channel, quit_cmd, 1)
                 commands_executed.append((quit_cmd, quit_output, "退出接口"))
-                
+
                 configured_count += 1
             else:
-                print(f"[INFO] 设备 {ip} 物理接口 {physical_interface} 对应的 {dot31_interface} 不在OSPF进程中，跳过")
+                print(
+                    f"[INFO] 设备 {ip} 物理接口 {physical_interface} 对应的 {dot31_interface} 不在OSPF进程中，跳过")
 
         # 特殊处理：检查是否有在OSPF中但没有LLDP邻居的.31接口
         for ospf_interface in ospf_interfaces:
             # 提取物理接口名称（去掉.31后缀）
             physical_interface = ospf_interface.replace('.31', '')
-            
+
             # 如果这个物理接口没有LLDP邻居信息，记录警告
             if physical_interface not in lldp_neighbors:
-                print(f"[WARNING] 设备 {ip} 接口 {ospf_interface} 在OSPF中但没有找到对应的LLDP邻居信息")
+                print(
+                    f"[WARNING] 设备 {ip} 接口 {ospf_interface} 在OSPF中但没有找到对应的LLDP邻居信息")
                 # 可以选择记录到日志或报告中
-                commands_executed.append((f"warning_{ospf_interface}", f"接口 {ospf_interface} 在OSPF中但缺少LLDP邻居信息", "需要手动检查"))
+                commands_executed.append(
+                    (f"warning_{ospf_interface}", f"接口 {ospf_interface} 在OSPF中但缺少LLDP邻居信息", "需要手动检查"))
 
         print(f"[INFO] 设备 {ip} 共配置了 {configured_count} 个接口描述")
 
@@ -10140,13 +10388,15 @@ def process_device_interface_description(ip, user, pwd, writer, fail_log, file_l
                 channel.close()
                 print(f"[DEBUG] 设备 {ip} 连接已关闭")
             except Exception as close_error:
-                print(f"{Fore.YELLOW}⚠️ 关闭 {ip} 连接时出错: {close_error}{Style.RESET_ALL}")
+                print(
+                    f"{Fore.YELLOW}⚠️ 关闭 {ip} 连接时出错: {close_error}{Style.RESET_ALL}")
 
 
 def generate_interface_description_report(raw_file, report_file, host_file):
     """生成接口描述配置报告（修复版本）"""
-    print(f"[generate_interface_description_report] 开始生成报告，源文件: {raw_file}, 目标文件: {report_file}")
-    
+    print(
+        f"[generate_interface_description_report] 开始生成报告，源文件: {raw_file}, 目标文件: {report_file}")
+
     connection_failures = set()
     try:
         with open("failure_ips.tmp", "r", encoding='utf-8') as f:
@@ -10172,7 +10422,7 @@ def generate_interface_description_report(raw_file, report_file, host_file):
         writer = csv.writer(report)
         writer.writerow(["设备IP", "设备名称", "运行指令", "执行状态", "接口", "描述内容", "设备输出"])
         print(f"[DEBUG] 写入报告表头")
-        
+
         processed_ips = set()
         current_device_name = "未知设备"
         current_interface = ""
@@ -10185,13 +10435,14 @@ def generate_interface_description_report(raw_file, report_file, host_file):
 
             device_ip, cmd, output = row[0], row[1], row[2]
             status = row[3] if len(row) > 3 else "执行成功"
-            
+
             processed_ips.add(device_ip)
 
             # 提取设备名称
             if cmd == "con":
                 name_match = re.search(r'\[([^\]]+)\]', output, re.MULTILINE)
-                current_device_name = name_match.group(1).strip() if name_match else "未知设备"
+                current_device_name = name_match.group(
+                    1).strip() if name_match else "未知设备"
 
             # 提取接口和描述信息（支持万兆接口）
             if (cmd.startswith("inter gigabitethernet") or cmd.startswith("inter xgigabitethernet")) and ".31" in cmd:
@@ -10207,7 +10458,8 @@ def generate_interface_description_report(raw_file, report_file, host_file):
             elif cmd.startswith("warning_"):
                 status = "需要手动检查"
 
-            writer.writerow([device_ip, current_device_name, cmd, status, current_interface, current_description, output])
+            writer.writerow([device_ip, current_device_name, cmd,
+                            status, current_interface, current_description, output])
 
         # 处理连接失败的设备
         for ip in host_ips:
@@ -10216,8 +10468,156 @@ def generate_interface_description_report(raw_file, report_file, host_file):
 
     print(f"✅ 接口描述配置报告生成完成，共处理 {len(host_ips)} 台设备")
 
+#
 
-#···········
+
+def parse_protect_group_all(protect_group_output, l2vc_output):
+    """
+    解析show protect-group all和show mpls l2vc brief命令输出
+    返回保护组状态信息列表
+    """
+    protect_groups = []
+    
+    if not protect_group_output:
+        return [{
+            'aps_id': '-', 'status': '-', 'master_vcid': '-', 'backup_vcid': '-',
+            'type': '-', 'direction': '-', 'recovery': '-', 'sd': '-', 'wtr': '-',
+            'hold_off': '-', 'protect_enable': '-', 'external_cmd': '-',
+            'send_aps': '-', 'recv_aps': '-',
+            'master_destination': '-', 'master_service_name': '-', 'master_vc_status': '-', 'master_interface': '-',
+            'backup_destination': '-', 'backup_service_name': '-', 'backup_vc_status': '-', 'backup_interface': '-',
+            'result': 'normal'
+        }]
+    
+    # 解析L2VC信息，建立VCID到业务信息的映射
+    l2vc_data_by_vcid = {}
+    if l2vc_output:
+        l2vc_lines = l2vc_output.split('\n')
+        in_table = False
+        for line in l2vc_lines:
+            line = line.strip()
+            if "VC-ID" in line and "Destination" in line:
+                in_table = True
+                continue
+            if in_table and line and not line.startswith('-'):
+                import re
+                parts = re.split(r'\s{2,}', line.strip())
+                if len(parts) >= 6:
+                    vcid = parts[0]
+                    destination = parts[1]
+                    service_name = parts[2]
+                    vc_status = parts[3]
+                    interface = parts[4]
+                    l2vc_data_by_vcid[vcid] = {
+                        'destination': destination,
+                        'service_name': service_name,
+                        'vc_status': '✅ UP' if vc_status.lower() == 'up' else '❌ Down',
+                        'interface': interface
+                    }
+    
+    # 解析保护组信息
+    protect_lines = protect_group_output.split('\n')
+    in_table = False
+    
+    for line in protect_lines:
+        line = line.strip()
+        
+        if not line or line.startswith('-'):
+            continue
+            
+        # 检测表格开始，使用英文表头
+        if "APS-ID" in line and "Status" in line and "Master/Backup" in line:
+            in_table = True
+            continue
+            
+        if in_table and line:
+            if line.startswith('[') and ']' in line:
+                break
+                
+            import re
+            match = re.match(r'(\d+)\s+(\S+)\s+(\d+)\s*\(([^)]+)\)/(\d+)\s*\(([^)]+)\)\s+(.+)', line)
+            
+            if match:
+                aps_id = match.group(1)
+                status = match.group(2)
+                master_vcid = match.group(3)
+                master_status = match.group(4)
+                backup_vcid = match.group(5)
+                backup_status = match.group(6)
+                remaining_fields = match.group(7)
+                
+                remaining_parts = re.split(r'\s{2,}', remaining_fields.strip())
+                if len(remaining_parts) >= 8:
+                    type_field = remaining_parts[0]
+                    direction = remaining_parts[1]
+                    recovery = remaining_parts[2]
+                    sd = remaining_parts[3]
+                    wtr = remaining_parts[4]
+                    hold_off = remaining_parts[5]
+                    protect_enable = remaining_parts[6]
+                    external_cmd = remaining_parts[7]
+                    send_aps = remaining_parts[8] if len(remaining_parts) > 8 else '-'
+                    recv_aps = remaining_parts[9] if len(remaining_parts) > 9 else '-'
+                else:
+                    type_field = direction = recovery = sd = wtr = hold_off = protect_enable = external_cmd = send_aps = recv_aps = '-'
+                
+                master_l2vc = l2vc_data_by_vcid.get(master_vcid, {})
+                master_destination = master_l2vc.get('destination', '-')
+                master_service_name = master_l2vc.get('service_name', '-')
+                master_vc_status = master_l2vc.get('vc_status', '-')
+                master_interface = master_l2vc.get('interface', '-')
+                
+                backup_l2vc = l2vc_data_by_vcid.get(backup_vcid, {})
+                backup_destination = backup_l2vc.get('destination', '-')
+                backup_service_name = backup_l2vc.get('service_name', '-')
+                backup_vc_status = backup_l2vc.get('vc_status', '-')
+                backup_interface = backup_l2vc.get('interface', '-')
+                
+                # 使用英文"Normal"判断状态
+                result = 'normal' if status == 'Normal' else 'error'
+                
+                protect_groups.append({
+                    'aps_id': aps_id,
+                    'status': status,
+                    'master_vcid': master_vcid,
+                    'backup_vcid': backup_vcid,
+                    'type': type_field,
+                    'direction': direction,
+                    'recovery': recovery,
+                    'sd': sd,
+                    'wtr': wtr,
+                    'hold_off': hold_off,
+                    'protect_enable': protect_enable,
+                    'external_cmd': external_cmd,
+                    'send_aps': send_aps,
+                    'recv_aps': recv_aps,
+                    'master_destination': master_destination,
+                    'master_service_name': master_service_name,
+                    'master_vc_status': master_vc_status,
+                    'master_interface': master_interface,
+                    'backup_destination': backup_destination,
+                    'backup_service_name': backup_service_name,
+                    'backup_vc_status': backup_vc_status,
+                    'backup_interface': backup_interface,
+                    'result': result
+                })
+    
+    if not protect_groups:
+        protect_groups.append({
+            'aps_id': '-', 'status': '无条目', 'master_vcid': '-', 'backup_vcid': '-',
+            'type': '-', 'direction': '-', 'recovery': '-', 'sd': '-', 'wtr': '-',
+            'hold_off': '-', 'protect_enable': '-', 'external_cmd': '-',
+            'send_aps': '-', 'recv_aps': '-',
+            'master_destination': '-', 'master_service_name': '-', 'master_vc_status': '-', 'master_interface': '-',
+            'backup_destination': '-', 'backup_service_name': '-', 'backup_vc_status': '-', 'backup_interface': '-',
+            'result': 'normal'
+        })
+    
+    return protect_groups
+
+# ···········
+
+
 def generate_qa_report(raw_file, report_file, host_file, selected_items):
     """Generate QA report with enhanced summary table visualization"""
     print(
@@ -10639,10 +11039,10 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     # Check SEN_01 only for temperature
                     try:
                         sen_01_value = float(sen_01)
-                        if sen_01_value > 85 or sen_01_value < 35:
+                        if sen_01_value > 89 or sen_01_value < 35:
                             error = True
                             print(
-                                f"{Fore.YELLOW}[DEBUG] SEN_01 温度 {sen_01} 超出范围（>85或<35），设置 error{Style.RESET_ALL}")
+                                f"{Fore.YELLOW}[DEBUG] SEN_01 温度 {sen_01} 超出范围（>89或<35），设置 error{Style.RESET_ALL}")
                     except (ValueError, TypeError):
                         pass  # Ignore invalid SEN_01 values
 
@@ -10953,7 +11353,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 item_counts[item['sheet_name']] = (
                     normal_results, total_results)
 
-        elif item['name'] == "主备主控软件版本一致性检查":
+        elif item['name'] == "FW软件版本一致性检查":
             headers = ["网元类型", "网元名称", "网元IP", "主用版本", "备用版本", "Result"]
             ws.append(headers)
             for cell in ws[1]:
@@ -12165,39 +12565,40 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             total_results = 0
             normal_results = 0
             for ip in sorted(host_ips):
+                # 跳过登录失败的设备
                 if ip in connection_failures:
                     continue
-
+                
+                # 获取设备基本信息，默认为 "-"
                 ne_type, device_name = "-", "-"
                 if ip in data and "show device" in data[ip]:
-                    ne_type, device_name, _, _ = parse_uptime(
-                        data[ip]["show device"])
-                # 检查 IP 是否在 data 中
-                if ip not in data:
-                    print(
-                        f"{Fore.YELLOW}[WARNING] IP {ip} 未在数据中找到， 跳过{Style.RESET_ALL}")
-                    continue
+                    ne_type, device_name, _, _ = parse_uptime(data[ip]["show device"])
 
-                # 检查是否是连接失败的设备
-                if ip in connection_failures:
-                    print(
-                        f"{Fore.YELLOW}[INFO] IP {ip} 连接失败： {connection_failures[ip]}{Style.RESET_ALL}")
+                # 检查必要的数据是否存在
+                if ip not in data or "show vsi brief" not in data[ip]:
+                    total_results += 1
+                    ws.append([ne_type, device_name, ip] + ["无数据"] * 15 + ["error"])
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+                    ws.cell(row=ws.max_row, column=19).fill = orange_fill  # Result列标橙
                     continue
-                vsi_output = data[ip]["show vsi brief"] if ip in data and "show vsi brief" in data[ip] else ""
-                services = parse_private_network_service(
-                    "", vsi_output, ne_type, device_name, ip)
+                
+                # 获取并解析专网业务输出
+                vsi_output = data[ip]["show vsi brief"]
+                services = parse_private_network_service("", vsi_output, ne_type, device_name, ip)
 
-                # 处理解析结果为空的情况
+                # 处理无条目情况
                 if not services or services[0]["类型"] == "-":
                     total_results += 1
-                    ws.append([ne_type, device_name, ip] + ["-"]
-                              * 15 + ["normal"])
+                    ws.append([ne_type, device_name, ip] + ["-"] * 15 + ["normal"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     normal_results += 1
                     continue
-
+                
+                # 处理正常条目
                 start_row = ws.max_row + 1
                 for service in services:
                     total_results += 1
@@ -12205,48 +12606,32 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         normal_results += 1
 
                     row_data = [
-                        service["网元类型"],
-                        service["网元名称"],
-                        service["网元IP"],
-                        service["类型"],
-                        service["VSI_ID"],
-                        service["VSI名称"],
-                        service["MTU"],
-                        service["目的节点"],
-                        service["状态"],
-                        service["VC_ID"],
-                        service["入标签"],
-                        service["出标签"],
-                        service["隧道ID"],
-                        service["接口"],
-                        service["PE VLAN[服务提供商]"],
-                        service["CE VLAN[用户侧]"],
-                        service["剥离外层 VLAN"],
-                        service["HSID"],
-                        service["Result"]
+                        service["网元类型"], service["网元名称"], service["网元IP"],
+                        service["类型"], service["VSI_ID"], service["VSI名称"], service["MTU"],
+                        service["目的节点"], service["状态"], service["VC_ID"],
+                        service["入标签"], service["出标签"], service["隧道ID"], service["接口"],
+                        service["PE VLAN[服务提供商]"], service["CE VLAN[用户侧]"],
+                        service["剥离外层 VLAN"], service["HSID"], service["Result"]
                     ]
                     ws.append(row_data)
 
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
-
                     if service["Result"] != "normal":
-                        # Result列填充橙色
-                        ws.cell(row=ws.max_row, column=19).fill = orange_fill
+                        ws.cell(row=ws.max_row, column=19).fill = orange_fill  # Result列标橙
 
                 end_row = ws.max_row
                 if start_row < end_row:
                     for col in range(1, 4):  # 合并网元类型、名称、IP列
-                        ws.merge_cells(
-                            start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+                        ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
 
             # 计算健康度
-            health_percentage = (
-                normal_results / total_results * 100) if total_results > 0 else 0
+            health_percentage = (normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-
+    
+        
         elif item['name'] == "PTP时钟检查":
             headers = ["网元类型", "网元名称", "网元IP", "时钟标识", "PTP状态", "时钟模式", "域值",
                        "从模式", "步进模式", "BMC优先级1", "BMC优先级2", "BMC时钟等级", "BMC时钟精度",
@@ -12543,7 +12928,98 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             item_counts[item['sheet_name']] = (
                 len(devices_data), len(devices_data))
 
-#
+        elif item['name'] == "BFD保护组状态信息":
+            headers = [
+                "网元类型", "网元名称", "网元IP", "APS-ID", "状态", "主VCID", "备VCID", "类型", "方向", "恢复", 
+                "SD", "WTR", "保持关闭", "保护使能", "外部命令", "发送APS", "接收APS", "loopback31地址",
+                "主用目的地址", "主用业务名称", "主用VC状态", "主用接口",
+                "备用目的地址", "备用业务名称", "备用VC状态", "备用接口", "Result"
+            ]
+            ws.append(headers)
+            
+            # 设置表头格式
+            for cell in ws[1]:
+                cell.fill = yellow_fill
+                cell.alignment = center_alignment
+                cell.border = thin_border
+            
+            for ip in host_ips:
+                if ip in connection_failures:
+                    continue  # 跳过登录失败的设备
+                    
+                # 获取设备基本信息
+                ne_type, device_name = "-", "-"
+                loopback31_address = "-"
+                
+                if ip in data and "show device" in data[ip]:
+                    ne_type, device_name, _, _ = parse_uptime(data[ip]["show device"])
+                    
+                if ip in data and "show interface loopback 31" in data[ip]:
+                    loopback31_output = data[ip]["show interface loopback 31"]
+                    loopback31_address = parse_loopback31(loopback31_output)
+                
+                # 检查必要的命令输出是否存在
+                if ip not in data or "show protect-group all" not in data[ip] or "show mpls l2vc brief" not in data[ip]:
+                    total_results += 1
+                    ws.append([ne_type, device_name, ip] + ["无数据"] * 24 + ["error"])
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+                    ws.cell(row=ws.max_row, column=27).fill = orange_fill  # Result列
+                    continue
+                
+                # 获取命令输出
+                protect_group_output = data[ip]["show protect-group all"]
+                l2vc_output = data[ip]["show mpls l2vc brief"]
+                
+                # 解析保护组状态信息
+                protect_groups = parse_protect_group_all(protect_group_output, l2vc_output)
+                
+                start_row = ws.max_row + 1
+                for group in protect_groups:
+                    total_results += 1
+                    ws.append([
+                        ne_type, device_name, ip,
+                        group['aps_id'], group['status'], group['master_vcid'], group['backup_vcid'],
+                        group['type'], group['direction'], group['recovery'], group['sd'], group['wtr'],
+                        group['hold_off'], group['protect_enable'], group['external_cmd'],
+                        group['send_aps'], group['recv_aps'], loopback31_address,
+                        group['master_destination'], group['master_service_name'], 
+                        group['master_vc_status'], group['master_interface'],
+                        group['backup_destination'], group['backup_service_name'], 
+                        group['backup_vc_status'], group['backup_interface'],
+                        group['result']
+                    ])
+                    
+                    # 设置单元格格式
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+                    
+                    # 统计结果
+                    if group['result'] == "normal":
+                        normal_results += 1
+                    else:
+                        ws.cell(row=ws.max_row, column=27).fill = orange_fill  # Result列标红
+                
+                # 合并相同设备的基本信息列
+                end_row = ws.max_row
+                if start_row <= end_row:
+                    for col in range(1, 4):  # 合并网元类型、网元名称、网元IP
+                        if start_row < end_row:
+                            ws.merge_cells(start_row=start_row, start_column=col, 
+                                         end_row=end_row, end_column=col)
+                    # 合并loopback31地址列
+                    if start_row < end_row:
+                        ws.merge_cells(start_row=start_row, start_column=18, 
+                                     end_row=end_row, end_column=18)
+            
+            # 计算健康度
+            health_percentage = (normal_results / total_results * 100) if total_results > 0 else 0
+            health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
+    
+ #
     ws_failure = wb.create_sheet(title="登录失败设备")
     headers = ["网元IP", "故障原因"]
     ws_failure.append(headers)
@@ -12615,7 +13091,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "",
             "风扇转速及温度状态",
             "若温度异常，检查设备通风环境或清理灰尘；若风扇状态异常，检查风扇硬件或更换风扇。",
-            "板卡温度 > 85°C 或 < 35°C，输出 'error'；风扇速度非百分比数值或任一风扇速度 < 20%，输出 'error'；否则输出  'normal'。  ",
+            "板卡温度 > 89°C 或 < 35°C，输出 'error'；风扇速度非百分比数值或任一风扇速度 < 20%，输出 'error'；否则输出  'normal'。  ",
             "show fan; show temperature"
         ],
         "系统与硬件版本状态": [
@@ -12639,9 +13115,9 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "槽位 12 和 13 电压均为 0.0V 且比率 0.00，输出 'normal'；其他槽位电压 < 42V 或 > 58V 或为 0V，输出 'error'；电压    数  据缺失，输出 'error'；否则输出 'normal'。",
             "show voltage"
         ],
-        "主备主控软件版本一致性检查": [
+        "FW软件版本一致性检查": [
             "",
-            "主备主控软件版本一致性检查",
+            "FW软件版本一致性检查",
             "若主备版本不一致，需升级或回滚软件版本以保持一致；若数据缺失，检查设备配置或命令输出。",
             "主控与备控 system info 字符一致且软件版本一致，输出 'normal'；否则输出 'error'。",
             "show device"
@@ -12778,7 +13254,15 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "通过show device命令获取设备槽位和板卡信息，以面板图形式展示设备的物理布局。",
             "显示所有槽位的板卡类型和状态；主备板卡需标识Master/Backup状态；面板布局符合设备物理结构。",
             "show device"
-        ]
+        ],
+        "BFD保护组状态信息": [
+            "",
+            "BFD保护组状态信息",
+            "检查BFD保护组状态，匹配对应VCID的L2VC业务信息。",
+            "保护组状态正常则为 'normal'，异常则为 'error'。",
+            "show protect-group all; show mpls l2vc brief"
+
+        ],
     }
 
     # 修改后的指南内容生成代码 - 基于用户选择的项目动态生成
@@ -13079,7 +13563,7 @@ if __name__ == '__main__':
   1️⃣2️⃣ 运行配置清洗       - 清洗导出的配置
   1️⃣3️⃣ 接口光功率检查     - 检查光功率和CRC
   1️⃣4️⃣ 光模块性能检查统计  - 检查统计光模块信息
-  1️⃣5️⃣ 运行自定义指令      - 批量执行自定义指令(单线程)
+  1️⃣5️⃣ 运行自定义指令      - 批量执行自定义指令
   1️⃣6️⃣ 统计检查设备状态    - 检查设备整体运行状态
   1️⃣7️⃣ 业务LSP检查       - 检查业务LSP状态
   1️⃣8️⃣ 设备告警检查统计   - 统计当前和历史告警
@@ -13511,10 +13995,10 @@ if __name__ == '__main__':
                     "category": "设备基础状态"
                 },
                 "9": {
-                    "name": "主备主控软件版本一致性检查",
+                    "name": "FW软件版本一致性检查",
                     "command": "show device",
                     "parser": parse_main_backup_version,
-                    "sheet_name": "主备主控软件版本一致性检查",
+                    "sheet_name": "FW软件版本一致性检查",
                     "category": "系统运行状态"
                 },
                 "10": {
@@ -13651,6 +14135,14 @@ if __name__ == '__main__':
                     "sheet_name": "设备面板视图",
                     "category": "设备状态"
                 },
+                "29": {
+                    "name": "BFD保护组状态信息",
+                    "command": "show protect-group all",
+                    "parser": parse_protect_group_all,
+                    "sheet_name": "BFD保护组状态信息",
+                    "category": "冗余与容灾"
+                }
+
 
             }
 
@@ -13783,7 +14275,10 @@ if __name__ == '__main__':
                     commands.extend(["show ldp lsp"])
                 if any(item['name'] == "设备面板视图" for item in selected_items):
                     commands.append("show device")
-
+                if any(item['name'] == "BFD保护组状态信息" for item in selected_items):
+                    commands.append("show protect-group all")
+                    commands.append("show mpls l2vc brief")
+                    commands.append("show interface loopback 31")
                 commands.append("show device")
 
                 # 去除重复项
@@ -13842,9 +14337,12 @@ if __name__ == '__main__':
 
         if ucmd == '21':
             print("\n📊 正在添加互联端口描述...")
-            host_file = getinput("userhost-stna.csv", "设备清单（默认：userhost-stna.csv）：", timeout=10)
-            raw_file = getinput("interface_description_raw.txt", "原始数据文件（默认：  interface_description_raw.txt）：", timeout=10)
-            report_file = getinput("接口描述配置报告.csv", "输出报告（默认：接口描述配置报告.csv）：",  timeout=10)
+            host_file = getinput("userhost-stna.csv",
+                                 "设备清单（默认：userhost-stna.csv）：", timeout=10)
+            raw_file = getinput("interface_description_raw.txt",
+                                "原始数据文件（默认：  interface_description_raw.txt）：", timeout=10)
+            report_file = getinput(
+                "接口描述配置报告.csv", "输出报告（默认：接口描述配置报告.csv）：",  timeout=10)
 
             print(f"\n{Fore.CYAN}🚀 开始配置接口描述...{Style.RESET_ALL}")
             add_interface_description_cmd(host_file, raw_file, report_file)
