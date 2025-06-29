@@ -1,17 +1,12 @@
 """
-STN-A设备巡检系统 v2.7
+STN-A设备巡检系统 v2.8
 使用前需手动安装模块：pip install openpyxl pytz paramiko tqdm colorama pyinstaller
 更新说明：
-- 增强功能BFD会话检查(VC业务统计)
 - 修复若干BUG
-- 修改最大连接数为40
-- 新增巡检功能28设备面板视图
-- 新增功能21自动设置互联端口描述
-- 新增QA巡检子功能-BFD保护组状态信息
         
 作者：杨茂森
 
-最后更新：2025-6-15
+最后更新：2025-6-29
 """
 # 导入必要的库
 from openpyxl.styles import PatternFill, Alignment, Border, Side
@@ -60,12 +55,15 @@ import pytz  # 需要导入 pytz 来处理时区
 from openpyxl.cell.cell import MergedCell
 import shutil
 import openpyxl
+
+
 workbook = openpyxl.Workbook()  # Creates a new workbook
 
 # 初始化 colorama
 init(autoreset=True)
 # 初始化打印锁
 print_lock = Lock()
+
 
 def input_with_timeout(prompt, default, timeout=10):
     print(f"{Fore.CYAN}{prompt}{Style.RESET_ALL}", end='')
@@ -158,97 +156,6 @@ logging.basicConfig(
 )
 
 
-def create_channel(ip, username, password, port=22, timeout=10, retry_count=3, retry_delay=2):
-    """
-    创建SSH通道连接，增加了重试机制和更好的错误处理
-
-    Args:
-        ip: 设备IP地址
-        username: 用户名
-        password: 密码
-        port: SSH端口，默认22
-        timeout: 连接超时时间(秒)
-        retry_count: 重试次数
-        retry_delay: 重试间隔(秒)
-
-    Returns:
-        成功返回SSH通道，失败返回None
-    """
-    client = None
-    for attempt in range(1, retry_count + 1):
-        try:
-            with print_lock:
-                print(
-                    f"\n{Fore.CYAN}🔄 正在连接设备 {ip} (尝试 {attempt}/{retry_count})...{Style.RESET_ALL}")
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            client.connect(
-                hostname=ip,
-                port=port,
-                username=username,
-                password=password,
-                timeout=timeout,
-                allow_agent=False,
-                look_for_keys=False,
-                banner_timeout=timeout
-            )
-
-            channel = client.invoke_shell()
-            channel.settimeout(timeout)
-            if channel.recv_ready():
-                _ = channel.recv(4096).decode('utf-8', 'ignore')
-
-            with print_lock:
-                print(f"\n{Fore.GREEN}✅ 设备 {ip} 连接成功{Style.RESET_ALL}")
-            return channel
-
-        except paramiko.AuthenticationException:
-            client_close(client)
-            with print_lock:
-                print(f"\n{Fore.RED}❌ 设备 {ip} 认证失败 - 用户名或密码错误{Style.RESET_ALL}")
-            logging.error(f"设备 {ip} 认证失败 - 用户名或密码错误")
-            raise ValueError("认证失败")
-
-        except paramiko.SSHException as ssh_ex:
-            client_close(client)
-            with print_lock:
-                print(
-                    f"\n{Fore.YELLOW}⚠️ 设备 {ip} SSH异常: {ssh_ex}{Style.RESET_ALL}")
-            logging.warning(f"设备 {ip} SSH异常: {ssh_ex}")
-
-        except socket.timeout:
-            client_close(client)
-            with print_lock:
-                print(
-                    f"\n{Fore.YELLOW}⌛ [连接响应超时] {ip} 请检查网络或设备负载{Style.RESET_ALL}")
-            logging.warning(f"设备 {ip} 连接超时")
-
-        except socket.error as sock_ex:
-            client_close(client)
-            with print_lock:
-                print(f"\n{Fore.RED}🌐 设备 {ip} 网络错误: {sock_ex}{Style.RESET_ALL}")
-            logging.error(f"设备 {ip} 网络错误: {sock_ex}")
-
-        except Exception as ex:
-            client_close(client)
-            with print_lock:
-                print(f"\n{Fore.RED}❗ 设备 {ip} 连接异常: {ex}{Style.RESET_ALL}")
-            logging.error(f"设备 {ip} 连接异常: {ex}")
-
-        if attempt < retry_count:
-            retry_time = retry_delay * attempt
-            with print_lock:
-                print(f"\n{Fore.CYAN}⏳ 等待{retry_time}秒后重试...{Style.RESET_ALL}")
-            time.sleep(retry_time)
-        else:
-            logging.error(f"设备 {ip} 连接失败，已达到最大重试次数")
-            with print_lock:
-                print(f"\n{Fore.RED}🚫 设备 {ip} 连接失败，已达到最大重试次数{Style.RESET_ALL}")
-
-    return None
-
-
 def client_close(client):
     """安全关闭SSH客户端"""
     if client:
@@ -256,107 +163,6 @@ def client_close(client):
             client.close()
         except:
             pass
-
-
-def execute_some_command(channel, command, timeout=5, max_retries=3, command_delay=1, device_name="", ip=""):
-    """
-    执行命令并返回输出结果，处理分页提示，并在检测到特定错误时重试
-    同时检测输出中是否含有"Start Switching"，若有则终止程序
-
-    Args:
-        channel: SSH通道
-        command: 要执行的命令
-        timeout: 总超时时间(秒)
-        max_retries: 最大重试次数
-        command_delay: 发送命令前等待的时间(秒)
-        device_name: 设备名称，用于主备切换错误报告
-        ip: 设备IP地址，用于主备切换错误报告
-
-    Returns:
-        命令执行的输出结果
-    """
-    import select
-    import socket
-    import sys
-    import logging
-    import time
-    from colorama import Fore, Style
-
-    if not channel:
-        return ""
-
-    # 在发送命令前添加延迟，确保设备已准备好接收新命令
-    time.sleep(command_delay)  # 添加命令前延迟
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            # 清空缓冲区并处理未完成的分页提示
-            while channel.recv_ready():
-                data = channel.recv(4096).decode('utf-8', 'ignore')
-                if '----MORE----' in data:
-                    channel.send(' ')
-                    time.sleep(0.5)  # 增加分页处理延迟
-
-            # 发送命令
-            channel.send(command + '\n')
-
-            # 等待命令开始执行 - 增加延迟
-            time.sleep(1.5)  # 从0.5增加到1.5秒
-
-            output = ""
-            start_time = time.time()
-            while time.time() - start_time < timeout:  # 修复变量名错误
-                rlist, _, _ = select.select([channel], [], [], 5.0)
-                if not rlist:
-                    logging.warning(f"命令 {command} 数据接收超时")
-                    break
-
-                data = channel.recv(65535).decode('utf-8', 'ignore')
-                output += data
-
-                # 检查输出是否包含主备切换指示
-                if "Start Switching" in output:
-                    # 输出三次错误信息
-                    error_msg = f"⚠️⚠️⚠️ 检测到设备 {device_name}({ip}) 发生主备切换! 终止操作! ⚠️⚠️⚠️"
-                    for i in range(3):
-                        print(f"{Fore.RED}{error_msg}{Style.RESET_ALL}")
-                        logging.critical(error_msg)
-
-                    # 终止程序
-                    sys.exit(1)
-
-                # 检查最后一行的内容
-                lines = output.split('\n')
-                if lines:
-                    last_line = lines[-1].strip()
-                    if last_line == '----MORE----':
-                        channel.send(' ')
-                        time.sleep(0.5)  # 增加分页处理延迟
-                    elif last_line.endswith('>') or last_line.endswith('#') or last_line.endswith('$'):
-                        # 增加命令执行完成后的延迟，确保设备已完全处理
-                        time.sleep(0.5)  # 添加命令完成后延迟
-                        break
-
-            # 检查输出中是否包含错误信息
-            if "ERROR: Invalid input detected at '^' marker" not in output:
-                return output  # 成功执行
-            elif attempt < max_retries:
-                logging.warning(f"检测到错误，尝试重试 {attempt}/{max_retries}")
-                time.sleep(2)  # 在重试前等待时间从1秒增加到2秒
-            else:
-                logging.error(f"命令 {command} 达到最大重试次数")
-                return output  # 返回最后一次的输出
-
-        except socket.timeout:
-            logging.warning(f"命令执行超时: {command}")
-            return f"命令执行超时\n已执行部分输出:\n{output}"
-
-        except Exception as ex:
-            logging.error(f"执行命令出错: {ex}")
-            return f"命令执行错误: {ex}"
-
-    # 如果所有重试都失败，返回最后一次的输出
-    return output
 
 
 def config_host(channel, filename, revfile, ipaddr='', device_name='', cmd_delay=1):
@@ -1502,7 +1308,7 @@ def generate_port_report(src_file, dst_file, host_list_file):
 
         for ip in all_devices:
             if ip in failure_ips:
-                writer.writerow([ip, "无数据", "-", "连接失败"])
+                writer.writerow([ip, "数据异常", "-", "连接失败"])
                 continue
 
             ports = port_data.get(ip, [])
@@ -1659,7 +1465,7 @@ def generate_board_report(src_file, dst_file, host_list_file):
 
         for ip in all_devices:
             if ip in failure_ips:
-                writer.writerow([ip, "无数据", "-", "-", "连接失败"])
+                writer.writerow([ip, "数据异常", "-", "-", "连接失败"])
                 continue
 
             dev_name = device_names.get(ip, "未知设备")
@@ -1849,7 +1655,7 @@ def generate_port_usage_report(src_file, dst_file, host_list_file):
 
         for ip in all_devices:
             if ip in failure_ips:
-                writer.writerow([ip, "无数据", "-", "-", "-",
+                writer.writerow([ip, "数据异常", "-", "-", "-",
                                 "-", "-", "-", "-", "-", "连接失败"])
                 continue
 
@@ -2249,7 +2055,7 @@ def generate_lldp_neighbor_report(src_file, dst_file, host_list_file):
                     writer.writerow(row)
             else:
                 # 未采集到数据但不在失败列表中的设备
-                row = [ip, "未知设备", "-", "-", "-", "-", "-", "无数据"]
+                row = [ip, "未知设备", "-", "-", "-", "-", "-", "数据异常"]
                 writer.writerow(row)
 
     print(f"{Fore.GREEN}✅ 报告生成完成，共处理 {len(host_ips)} 台设备{Style.RESET_ALL}")
@@ -2462,7 +2268,7 @@ def generate_arp_report(src_file, dst_file, host_list_file):
                            "-", "-", "-", "-", "无ARP数据"]
                     writer.writerow(row)
             else:
-                row = [ip, "未知设备", "-", "-", "-", "-", "-", "无数据"]
+                row = [ip, "未知设备", "-", "-", "-", "-", "-", "数据异常"]
                 writer.writerow(row)
 
     print(f"{Fore.GREEN}✅ 报告生成完成，共处理 {len(host_ips)} 台设备{Style.RESET_ALL}")
@@ -3584,15 +3390,50 @@ def fish_custom_cmd(host_file, raw_file, commands, max_workers=40):
 
     print("[END] 自定义指令数据采集完成")
 
+#
+
+
+def detect_device_type(channel, ip):
+    """检测设备类型，判断是否为A3设备"""
+    try:
+        # 清空缓冲区
+        while channel.recv_ready():
+            channel.recv(4096).decode('utf-8', 'ignore')
+
+        # 发送回车获取提示符
+        channel.send('\n')
+        time.sleep(1)
+
+        output = ""
+        if channel.recv_ready():
+            output = channel.recv(4096).decode('utf-8', 'ignore')
+
+        with print_lock:
+            print(f"[DEBUG] 设备 {ip} 提示符检测: {repr(output[:200])}")
+
+        # 检查是否包含A3标识
+        is_a3_device = "MssEdge25-S10-3" in output or "A3-" in output
+
+        with print_lock:
+            print(
+                f"[DEBUG] 设备 {ip} 检测结果: {'A3设备' if is_a3_device else '非A3设备'}")
+
+        return is_a3_device
+
+    except Exception as e:
+        with print_lock:
+            print(f"[WARNING] 设备 {ip} 类型检测失败: {e}")
+        return False
+
 
 def process_custom_commands(ip, username, password, commands, writer, fail_log):
-    """处理单个设备的自定义指令采集"""
+    """处理单个设备的自定义指令采集 - 修复版本（保持PC时间功能）"""
     from threading import Lock
     import time
+    from datetime import datetime
 
     # 文件写入锁和打印锁，确保线程安全
     file_lock = Lock()
-    print_lock = Lock()  # 添加打印锁
     channel = None
 
     try:
@@ -3606,9 +3447,6 @@ def process_custom_commands(ip, username, password, commands, writer, fail_log):
             with file_lock:  # 线程安全写入失败记录
                 fail_log.write(f"{ip}\n")
                 fail_log.flush()
-                # 为所有命令写入连接失败记录
-                for cmd in commands:
-                    writer.writerow([ip, cmd, "连接失败"])
             with print_lock:
                 print(f"[ERROR] 设备 {ip} 连接失败")
             return
@@ -3617,18 +3455,67 @@ def process_custom_commands(ip, username, password, commands, writer, fail_log):
             print(f"[SUCCESS] 设备 {ip} 连接成功")
 
         try:
-            # 设置屏幕长度避免分页
+            # 增加初始等待时间，确保设备完全准备好
+            time.sleep(2)
+
+            # 清空初始登录信息
+            while channel.recv_ready():
+                channel.recv(65535).decode('utf-8', 'ignore')
+                time.sleep(0.1)
+
+            # 发送一个回车，获取干净的提示符
+            channel.send('\n')
+            time.sleep(1)
+
+            # 再次清空缓冲区
+            while channel.recv_ready():
+                channel.recv(65535).decode('utf-8', 'ignore')
+                time.sleep(0.1)
+
+            # 检测设备类型
+            is_a3_device = detect_device_type(channel, ip)
+
+            # 根据设备类型设置屏幕长度
+            if is_a3_device:
+                screen_length_cmd = "screen-length 512"
+                restore_cmd = "screen-length 25"
+            else:
+                screen_length_cmd = "screen-length 0"
+                restore_cmd = "screen-length 25"
+
             with print_lock:
-                print(f"[DEBUG] 设备 {ip} 设置 screen-length 512...")
-            execute_some_command(channel, "screen-length 512", 1)
+                print(f"[DEBUG] 设备 {ip} 设置命令: {screen_length_cmd}")
+
+            execute_some_command(channel, screen_length_cmd,
+                                 3, ip=ip, is_a3=is_a3_device)
+
+            # 设置屏幕长度后等待一下
+            time.sleep(1)
 
             # 执行所有自定义命令
             for cmd_idx, cmd in enumerate(commands):
                 try:
                     with print_lock:
-                        print(f"[COMMAND] 设备 {ip} 执行命令 ({cmd_idx+1}/{len(commands)}): {cmd}")
-                    
-                    output = execute_some_command(channel, cmd, 3)
+                        print(
+                            f"[COMMAND] 设备 {ip} 执行命令 ({cmd_idx+1}/{len(commands)}): {cmd}")
+
+                    # 在每个命令执行前清空缓冲区
+                    while channel.recv_ready():
+                        channel.recv(65535).decode('utf-8', 'ignore')
+                        time.sleep(0.1)
+
+                    # 在真正开始执行命令时记录PC时间（确保每个设备时间不同）
+                    pc_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                    # 执行命令，如果出现语法错误则重试
+                    output = execute_command_with_retry(
+                        channel, cmd, ip, is_a3_device)
+
+                    # 验证输出是否包含命令回显
+                    if cmd not in output:
+                        with print_lock:
+                            print(
+                                f"[WARNING] 设备 {ip} 命令 '{cmd}' 的输出可能不完整，未找到命令回显")
 
                     # 清理输出内容
                     clean_output = "\n".join([
@@ -3637,27 +3524,46 @@ def process_custom_commands(ip, username, password, commands, writer, fail_log):
                         if line.strip() and line.strip() != cmd
                     ])
 
+                    # 将PC时间附加到输出中（保持PC时间功能）
+                    clean_output_with_time = f"PC_TIME: {pc_time}\n{clean_output}"
+
                     with print_lock:
-                        print(f"[OUTPUT] 设备 {ip} 命令 {cmd} 输出长度: {len(clean_output)} 字符")
+                        print(
+                            f"[OUTPUT] 设备 {ip} 命令 {cmd} 输出长度: {len(clean_output)} 字符")
+                        # 显示设备输出内容预览（前1000字符）
+                        if clean_output:
+                            output_preview = clean_output[:1000]
+                            print(f"[OUTPUT-PREVIEW] 设备 {ip} 命令 '{cmd}' 输出预览:")
+                            print("-" * 60)
+                            print(output_preview)
+                            if len(clean_output) > 1000:
+                                print(
+                                    f"... (还有 {len(clean_output) - 1000} 字符)")
+                            print("-" * 60)
 
                     with file_lock:  # 线程安全写入
-                        writer.writerow([ip, cmd, clean_output])
+                        writer.writerow([ip, cmd, clean_output_with_time])
 
                     with print_lock:
                         print(f"[DEBUG] 设备 {ip} 命令 {cmd} 处理完成")
 
+                    # 命令间增加延迟，避免设备处理不及
+                    time.sleep(1)
+
                 except Exception as single_cmd_error:
                     error_msg = f"命令执行失败: {str(single_cmd_error)}"
                     with print_lock:
-                        print(f"[ERROR] 设备 {ip} 命令 '{cmd}' 执行异常: {str(single_cmd_error)}")
+                        print(
+                            f"[ERROR] 设备 {ip} 命令 '{cmd}' 执行异常: {str(single_cmd_error)}")
                     with file_lock:
                         writer.writerow([ip, cmd, error_msg])
 
             # 恢复屏幕长度设置
             try:
                 with print_lock:
-                    print(f"[DEBUG] 设备 {ip} 恢复 screen-length 25...")
-                execute_some_command(channel, "screen-length 25", 1)
+                    print(f"[DEBUG] 设备 {ip} 恢复命令: {restore_cmd}")
+                execute_some_command(channel, restore_cmd,
+                                     3, ip=ip, is_a3=is_a3_device)
             except Exception as restore_error:
                 with print_lock:
                     print(f"[WARNING] 设备 {ip} 恢复屏幕长度设置失败: {restore_error}")
@@ -3668,10 +3574,6 @@ def process_custom_commands(ip, username, password, commands, writer, fail_log):
             with file_lock:
                 fail_log.write(f"{ip} - {str(cmd_error)}\n")
                 fail_log.flush()
-                # 为所有命令写入错误记录
-                for cmd in commands:
-                    error_msg = f"执行失败: {str(cmd_error)}"
-                    writer.writerow([ip, cmd, error_msg])
 
     except Exception as connection_error:
         with print_lock:
@@ -3679,10 +3581,6 @@ def process_custom_commands(ip, username, password, commands, writer, fail_log):
         with file_lock:
             fail_log.write(f"{ip} - {str(connection_error)}\n")
             fail_log.flush()
-            # 为所有命令写入连接异常记录
-            for cmd in commands:
-                error_msg = f"连接异常: {str(connection_error)}"
-                writer.writerow([ip, cmd, error_msg])
 
     finally:
         # 确保连接被正确关闭
@@ -3698,8 +3596,239 @@ def process_custom_commands(ip, username, password, commands, writer, fail_log):
                     print(f"[WARNING] 关闭设备 {ip} 连接时出错: {close_error}")
 
 
+def execute_some_command(channel, command, timeout=5, max_retries=3, command_delay=1.5, device_name="", ip="", is_a3=False):
+    """
+    执行命令并正确处理分页输出 - 修复版本，确保命令和输出正确对应
+    """
+    import select
+    import socket
+    import sys
+    import logging
+    import time
+    from colorama import Fore, Style
+
+    if not channel:
+        return ""
+
+    # 在发送命令前添加延迟
+    time.sleep(command_delay)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            with print_lock:
+                print(f"[DEBUG] 设备 {ip} 尝试第 {attempt} 次执行命令: {command}")
+
+            # 步骤1: 彻底清空缓冲区，包括发送回车并等待
+            cleared_data = ""
+            clear_count = 0
+
+            # 先发送一个回车，获取一个干净的提示符
+            channel.send('\n')
+            time.sleep(0.5)
+
+            # 清空所有缓冲数据
+            while channel.recv_ready():
+                data = channel.recv(65535).decode('utf-8', 'ignore')
+                cleared_data += data
+                clear_count += 1
+                if clear_count > 50:  # 防止无限循环
+                    break
+                time.sleep(0.1)
+
+            if cleared_data:
+                with print_lock:
+                    print(f"[DEBUG] 设备 {ip} 清空缓冲区，数据长度: {len(cleared_data)}")
+
+            # 步骤2: 发送命令并立即加上换行符
+            channel.send((command + '\n').encode('utf-8'))
+
+            # 步骤3: 等待命令被设备接收和处理
+            # A3设备需要更长的等待时间
+            initial_wait = 2.0 if is_a3 else 1.0
+            time.sleep(initial_wait)
+
+            output = ""
+            command_echo_found = False
+            start_time = time.time()
+            last_data_time = time.time()
+            pagination_count = 0
+            consecutive_no_data = 0
+
+            # 步骤4: 确保捕获到命令回显，这样才能确保后续是命令的输出
+            while time.time() - start_time < timeout:
+                readable, _, _ = select.select([channel], [], [], 0.3)
+
+                if readable:
+                    try:
+                        # 使用更大的缓冲区
+                        data = channel.recv(65535).decode('utf-8', 'ignore')
+
+                        if data:
+                            output += data
+                            last_data_time = time.time()
+                            consecutive_no_data = 0
+
+                            # 检查是否包含命令回显
+                            if not command_echo_found and command in output:
+                                command_echo_found = True
+                                with print_lock:
+                                    print(f"[DEBUG] 设备 {ip} 找到命令回显: {command}")
+
+                            # 简化调试输出：只在有分页符时显示
+                            if '----MORE----' in data:
+                                with print_lock:
+                                    print(
+                                        f"[DEBUG] 设备 {ip} 检测到分页符，数据长度: {len(data)}")
+
+                            # 处理A3设备的分页符
+                            if is_a3:
+                                while '----MORE----' in data:
+                                    pagination_count += 1
+                                    if pagination_count % 10 == 1:  # 每10次显示一次进度
+                                        with print_lock:
+                                            print(
+                                                f"[DEBUG] 设备 {ip} 检测到A3分页符 (第{pagination_count}次)")
+
+                                    # 发送空格继续
+                                    channel.send(' ')
+                                    time.sleep(0.5)  # A3设备需要更长的等待时间
+
+                                    # 等待并读取更多数据
+                                    wait_start = time.time()
+                                    new_data = ""
+                                    while time.time() - wait_start < 3:  # 等待最多3秒
+                                        if channel.recv_ready():
+                                            new_data = channel.recv(
+                                                65535).decode('utf-8', 'ignore')
+                                            if new_data:
+                                                output += new_data
+                                                data = new_data  # 更新data以继续检查分页
+                                                break
+                                        time.sleep(0.1)
+
+                                    if not new_data:
+                                        with print_lock:
+                                            print(
+                                                f"[DEBUG] 设备 {ip} 分页后无新数据，退出分页处理")
+                                        break
+
+                                    # 防止无限分页
+                                    if pagination_count > 200:
+                                        with print_lock:
+                                            print(
+                                                f"[WARNING] 设备 {ip} 分页次数过多({pagination_count})，强制结束")
+                                        channel.send('\x03')  # Ctrl+C
+                                        time.sleep(1)
+                                        break
+                            else:
+                                # 非A3设备的其他分页符处理保持原样
+                                while '----MORE----' in data or '--More--' in data or '-- More --' in data:
+                                    pagination_count += 1
+                                    if pagination_count % 10 == 1:  # 每10次显示一次
+                                        with print_lock:
+                                            print(
+                                                f"[DEBUG] 设备 {ip} 检测到分页符 (第{pagination_count}次)")
+
+                                    channel.send(' ')
+                                    time.sleep(0.2)
+
+                                    wait_start = time.time()
+                                    new_data = ""
+                                    while time.time() - wait_start < 2:
+                                        if channel.recv_ready():
+                                            new_data = channel.recv(
+                                                65535).decode('utf-8', 'ignore')
+                                            if new_data:
+                                                output += new_data
+                                                data = new_data
+                                                break
+                                        time.sleep(0.1)
+
+                                    if not new_data:
+                                        break
+
+                                    if pagination_count > 100:
+                                        with print_lock:
+                                            print(
+                                                f"[WARNING] 设备 {ip} 分页次数过多，强制结束")
+                                        channel.send('\x03')
+                                        time.sleep(1)
+                                        break
+
+                            # 检查主备切换
+                            if "Start Switching" in output:
+                                error_msg = f"⚠️⚠️⚠️ 检测到设备 {device_name}({ip}) 发生主备切换! 终止操作! ⚠️⚠️⚠️"
+                                for i in range(3):
+                                    print(
+                                        f"{Fore.RED}{error_msg}{Style.RESET_ALL}")
+                                    logging.critical(error_msg)
+                                sys.exit(1)
+
+                    except socket.error as e:
+                        with print_lock:
+                            print(f"[WARNING] 设备 {ip} 读取数据错误: {e}")
+                        break
+                else:
+                    consecutive_no_data += 1
+
+                    # 步骤5: 改进命令完成检测逻辑
+                    if command_echo_found and output.strip():  # 确保已经找到命令回显
+                        lines = output.split('\n')
+                        if len(lines) > 2:
+                            # 检查最后几行是否有提示符
+                            for line in lines[-5:]:  # 增加检查行数
+                                line_stripped = line.strip()
+                                if line_stripped and (line_stripped.endswith('>') or
+                                                      line_stripped.endswith('#') or
+                                                      line_stripped.endswith('$')):
+                                    # 确保最近没有分页提示
+                                    recent_output = output[-1000:] if len(
+                                        output) > 1000 else output
+                                    if ('----MORE----' not in recent_output and
+                                        '--More--' not in recent_output and
+                                            '-- More --' not in recent_output):
+                                        with print_lock:
+                                            print(
+                                                f"[DEBUG] 设备 {ip} 检测到命令完成，提示符: {repr(line_stripped)}")
+                                        return output
+
+                    # 检查是否超时无新数据
+                    if consecutive_no_data > 15:  # 连续15次没有数据 (约4.5秒)
+                        with print_lock:
+                            print(f"[DEBUG] 设备 {ip} 连续无新数据，结束命令执行")
+                        break
+
+            # 步骤6: 验证输出的有效性
+            if not command_echo_found:
+                with print_lock:
+                    print(f"[WARNING] 设备 {ip} 未找到命令回显，可能输出不完整")
+                # 如果没有找到命令回显，尝试重新执行
+                if attempt < max_retries:
+                    time.sleep(3)
+                    continue
+
+            # 最后检查输出
+            with print_lock:
+                print(f"[DEBUG] 设备 {ip} 命令执行完成，输出长度: {len(output)}")
+
+            return output
+
+        except Exception as ex:
+            with print_lock:
+                print(
+                    f"[ERROR] 设备 {ip} 执行命令异常 (尝试{attempt}/{max_retries}): {ex}")
+            if attempt < max_retries:
+                time.sleep(3)
+                continue
+            return f"命令执行错误: {ex}"
+
+    return output if 'output' in locals() else ""
+
+#
+
+
 def generate_custom_cmd_report(raw_file, report_file, host_file):
-    """生成自定义指令报告 (Generate Custom Command Report)"""
+    """生成自定义指令报告 (Generate Custom Command Report) - 排除连接失败的设备"""
     print(
         f"\n🐛 [DEBUG] 进入 generate_custom_cmd_report 函数，参数: raw_file={raw_file}, report_file={report_file}, host_file={host_file}")
 
@@ -3708,7 +3837,7 @@ def generate_custom_cmd_report(raw_file, report_file, host_file):
         print(f"🐛 [DEBUG] 正在读取连接失败记录 failure_ips.tmp")
         with open("failure_ips.tmp", "r", encoding='utf-8') as f:
             for line in f:
-                ip = line.strip().split(' - ')[0]  # 提取IP地址，忽略错误信息
+                ip = line.strip()  # 修改：直接使用strip()，因为现在只记录IP
                 if ip:
                     connection_failures.add(ip)
             print(f"🐛 [DEBUG] 读取到 {len(connection_failures)} 个连接失败的IP")
@@ -3727,6 +3856,12 @@ def generate_custom_cmd_report(raw_file, report_file, host_file):
         print(f"🐛 [DEBUG] ⚠️ 读取主机文件异常: {e}")
         return
 
+    # 过滤掉连接失败的设备，只分析成功连接的设备
+    successful_host_ips = [
+        ip for ip in host_ips if ip not in connection_failures]
+    print(
+        f"🐛 [DEBUG] 过滤后，参与分析的设备数量: {len(successful_host_ips)} 台 (排除了 {len(connection_failures)} 台连接失败的设备)")
+
     # 读取原始数据
     data = []
     try:
@@ -3739,13 +3874,14 @@ def generate_custom_cmd_report(raw_file, report_file, host_file):
         print(f"🐛 [DEBUG] ⚠️ 读取原始数据文件异常: {e}")
         return
 
-    # 生成报告
+    # 生成报告 - 只包含成功连接的设备
     try:
         print(f"🐛 [DEBUG] 正在生成报告文件: {report_file}")
         with open(report_file, "w", encoding='utf-8', newline='') as report:
             writer = csv.writer(report)
             writer.writerow(["设备IP", "设备名称", "运行指令", "执行状态", "设备输出"])
             processed_ips = set()
+            processed_count = 0
 
             print(f"🐛 [DEBUG] 开始处理原始数据...")
             for idx, row in enumerate(data):
@@ -3754,6 +3890,12 @@ def generate_custom_cmd_report(raw_file, report_file, host_file):
                     continue
 
                 device_ip, cmd, output = row
+
+                # 跳过连接失败的设备记录
+                if device_ip in connection_failures:
+                    print(f"🐛 [DEBUG] 跳过连接失败设备 {device_ip} 的记录")
+                    continue
+
                 print(
                     f"🐛 [DEBUG] 正在处理 {device_ip} 的第 {idx+1} 条记录，命令: {cmd[:20]}...")
 
@@ -3788,23 +3930,203 @@ def generate_custom_cmd_report(raw_file, report_file, host_file):
                     print(f"🐛 [DEBUG] {device_ip} 的命令执行状态为成功")
 
                 writer.writerow([device_ip, device_name, cmd, status, output])
-                print(f"🐛 [DEBUG] 已写入报告第 {idx+1} 行数据")
+                processed_count += 1
+                print(f"🐛 [DEBUG] 已写入报告第 {processed_count} 行数据")
 
-            # 处理连接失败但没有在原始数据中的设备
-            print(f"🐛 [DEBUG] 开始处理纯连接失败的设备...")
-            failure_count = 0
-            for ip in host_ips:
-                if ip not in processed_ips and ip in connection_failures:
-                    print(f"🐛 [DEBUG] 正在写入纯连接失败设备: {ip}")
-                    writer.writerow([ip, "连接失败", "-", "连接失败", "-"])
-                    failure_count += 1
-            print(f"🐛 [DEBUG] 共处理 {failure_count} 个纯连接失败设备")
+            # 检查是否有成功连接但没有在原始数据中的设备（理论上不应该出现）
+            missing_successful_devices = [
+                ip for ip in successful_host_ips if ip not in processed_ips]
+            if missing_successful_devices:
+                print(
+                    f"🐛 [DEBUG] ⚠️ 发现 {len(missing_successful_devices)} 台成功连接但没有数据的设备: {missing_successful_devices}")
+                for ip in missing_successful_devices:
+                    writer.writerow(
+                        [ip, "数据异常", "-", "数据缺失", "设备连接成功但无命令执行数据"])
+                    processed_count += 1
 
-        print(f"✅ 自定义指令报告生成完成，共处理 {len(host_ips)} 台设备")
+        print(f"✅ 自定义指令报告生成完成")
+        print(f"📊 统计信息:")
+        print(f"   - 总设备数量: {len(host_ips)} 台")
+        print(f"   - 连接失败设备: {len(connection_failures)} 台")
+        print(f"   - 参与分析设备: {len(successful_host_ips)} 台")
+        print(f"   - 实际处理记录: {processed_count} 条")
 
     except Exception as e:
         print(f"🐛 [DEBUG] ⚠️ 生成报告时异常: {e}")
         print(f"⛔ 报告生成错误: {e}")
+
+
+def create_channel(ip, username, password, port=22, timeout=10, retry_count=3, retry_delay=2):
+    """
+    创建SSH通道连接，增加了重试机制和更好的错误处理
+
+    Args:
+        ip: 设备IP地址
+        username: 用户名
+        password: 密码
+        port: SSH端口，默认22
+        timeout: 连接超时时间(秒)
+        retry_count: 重试次数
+        retry_delay: 重试间隔(秒)
+
+    Returns:
+        成功返回SSH通道，失败返回None
+    """
+    client = None
+    for attempt in range(1, retry_count + 1):
+        try:
+            with print_lock:
+                print(
+                    f"\n{Fore.CYAN}🔄 正在连接设备 {ip} (尝试 {attempt}/{retry_count})...{Style.RESET_ALL}")
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            client.connect(
+                hostname=ip,
+                port=port,
+                username=username,
+                password=password,
+                timeout=timeout,
+                allow_agent=False,
+                look_for_keys=False,
+                banner_timeout=timeout
+            )
+
+            channel = client.invoke_shell()
+            channel.settimeout(timeout)
+            if channel.recv_ready():
+                _ = channel.recv(4096).decode('utf-8', 'ignore')
+
+            with print_lock:
+                print(f"\n{Fore.GREEN}✅ 设备 {ip} 连接成功{Style.RESET_ALL}")
+            return channel
+
+        # except paramiko.AuthenticationException:
+        #     client_close(client)
+        #     with print_lock:
+        #         print(f"\n{Fore.RED}❌ 设备 {ip} 认证失败 - 用户名或密码错误{Style.RESET_ALL}")
+        #     logging.error(f"设备 {ip} 认证失败 - 用户名或密码错误")
+        #     raise ValueError("认证失败")
+
+        except paramiko.SSHException as ssh_ex:
+            client_close(client)
+            with print_lock:
+                print(
+                    f"\n{Fore.YELLOW}⚠️ 设备 {ip} SSH异常: {ssh_ex}{Style.RESET_ALL}")
+            logging.warning(f"设备 {ip} SSH异常: {ssh_ex}")
+
+        except socket.timeout:
+            client_close(client)
+            with print_lock:
+                print(
+                    f"\n{Fore.YELLOW}⌛ [连接响应超时] {ip} 请检查网络或设备负载{Style.RESET_ALL}")
+            logging.warning(f"设备 {ip} 连接超时")
+
+        except socket.error as sock_ex:
+            client_close(client)
+            with print_lock:
+                print(f"\n{Fore.RED}🌐 设备 {ip} 网络错误: {sock_ex}{Style.RESET_ALL}")
+            logging.error(f"设备 {ip} 网络错误: {sock_ex}")
+
+        except Exception as ex:
+            client_close(client)
+            with print_lock:
+                print(f"\n{Fore.RED}❗ 设备 {ip} 连接异常: {ex}{Style.RESET_ALL}")
+            logging.error(f"设备 {ip} 连接异常: {ex}")
+
+        if attempt < retry_count:
+            retry_time = retry_delay * attempt
+            with print_lock:
+                print(f"\n{Fore.CYAN}⏳ 等待{retry_time}秒后重试...{Style.RESET_ALL}")
+            time.sleep(retry_time)
+        else:
+            logging.error(f"设备 {ip} 连接失败，已达到最大重试次数")
+            with print_lock:
+                print(f"\n{Fore.RED}🚫 设备 {ip} 连接失败，已达到最大重试次数{Style.RESET_ALL}")
+
+    return None
+
+
+def execute_command_with_retry(channel, command, ip, is_a3, max_command_retries=3):
+    """
+    执行命令并检测语法错误，如果出现 'Invalid input detected' 错误则重试
+
+    Args:
+        channel: SSH通道
+        command: 要执行的命令
+        ip: 设备IP地址
+        is_a3: 是否为A3设备
+        max_command_retries: 最大重试次数，默认3次
+
+    Returns:
+        命令执行结果字符串
+    """
+    import time
+
+    for retry_attempt in range(1, max_command_retries + 1):
+        try:
+            with print_lock:
+                if retry_attempt > 1:
+                    print(
+                        f"[RETRY] 设备 {ip} 重试执行命令 (第{retry_attempt}次): {command}")
+
+            # 执行命令
+            output = execute_some_command(
+                channel, command, 30, ip=ip, is_a3=is_a3)
+
+            # 检查是否出现语法错误
+            if "ERROR:  Invalid input detected at '^' marker" in output:
+                with print_lock:
+                    print(f"[ERROR] 设备 {ip} 命令语法错误，尝试重新执行: {command}")
+                    print(f"[ERROR-OUTPUT] 错误输出: {output[:500]}")
+
+                if retry_attempt < max_command_retries:
+                    # 清理缓冲区后重试
+                    with print_lock:
+                        print(f"[DEBUG] 设备 {ip} 清理缓冲区，准备重试...")
+
+                    time.sleep(1)
+
+                    # 清空缓冲区
+                    clear_count = 0
+                    while channel.recv_ready():
+                        try:
+                            channel.recv(65535).decode('utf-8', 'ignore')
+                            clear_count += 1
+                            if clear_count > 20:  # 防止无限循环
+                                break
+                        except:
+                            break
+                        time.sleep(0.1)
+
+                    with print_lock:
+                        print(f"[DEBUG] 设备 {ip} 缓冲区清理完成，清理了 {clear_count} 次数据")
+
+                    continue
+                else:
+                    with print_lock:
+                        print(f"[ERROR] 设备 {ip} 命令重试次数已达上限，返回错误结果")
+                    return output
+            else:
+                # 命令执行成功，返回结果
+                if retry_attempt > 1:
+                    with print_lock:
+                        print(f"[SUCCESS] 设备 {ip} 命令重试成功: {command}")
+                return output
+
+        except Exception as e:
+            with print_lock:
+                print(
+                    f"[ERROR] 设备 {ip} 命令执行异常 (重试{retry_attempt}/{max_command_retries}): {e}")
+
+            if retry_attempt < max_command_retries:
+                time.sleep(2)
+                continue
+            else:
+                return f"命令执行错误: {e}"
+
+    # 如果所有重试都失败，返回最后的输出或错误信息
+    return output if 'output' in locals() else "命令执行失败：所有重试均失败"
 
 
 def fish_device_info_cmd(host_file, raw_file, max_workers=40):
@@ -3872,15 +4194,14 @@ def process_device_info(ip, user, pwd, commands, writer, fail_log):
 
     # 文件写入锁和打印锁，确保线程安全
     file_lock = Lock()
-    print_lock = Lock()  # 添加打印锁
     channel = None
-    
+
     try:
         with print_lock:
             print(f"\n[DEBUG] {'='*40}")
             print(f"[DEBUG] 开始处理设备: {ip}")
             print(f"[DEBUG] 尝试连接设备 {ip}...")
-            
+
         channel = create_channel(ip, user, pwd)
         if not channel:
             with file_lock:
@@ -3930,8 +4251,8 @@ def process_device_info(ip, user, pwd, commands, writer, fail_log):
                     print(f"[DEBUG] 设备 {ip} 连接已关闭")
             except Exception as close_error:
                 with print_lock:
-                    print(f"{Fore.YELLOW}⚠️ 关闭 {ip} 连接时出错: {close_error}{Style.RESET_ALL}")
-
+                    print(
+                        f"{Fore.YELLOW}⚠️ 关闭 {ip} 连接时出错: {close_error}{Style.RESET_ALL}")
 
 
 def generate_device_info_report(raw_file, report_file, host_file):
@@ -5195,7 +5516,8 @@ def generate_alarm_report(raw_file, report_file, host_file):
         if ip not in alarm_data:
             print(
                 f"[WARNING] 设备 {ip} 不在 alarm_data 中，但也不在 connection_failures 中")
-            ws_main.append([ip, "未知设备", "无数据", 0, 0, 0, 0, 0, "无数据", "异常", ""])
+            ws_main.append([ip, "未知设备", "数据异常", 0, 0,
+                           0, 0, 0, "数据异常", "异常", ""])
             continue
 
         device_name = alarm_data[ip]['name'] or "未知设备"
@@ -5548,6 +5870,14 @@ def generate_time_sync_report(raw_file, report_file, host_file):
 
 def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
     """Collect data for multiple commands from devices with debug output."""
+    import csv
+    import shutil
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from tqdm import tqdm
+    from colorama import Fore, Style
+
     print(
         f"{Fore.CYAN}[START] 开始采集QA巡检数据，输入文件: {host_file}, 输出文件: {raw_file}, 命令: {commands}{Style.RESET_ALL}")
 
@@ -5567,8 +5897,9 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
 
                 # 设置 tqdm 进度条，留出 20 个字符空间给其他信息
                 bar_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
-                pbar = tqdm(total=total_devices, desc="🔍 QA巡检数据采集进度", unit="台",
-                            bar_format=bar_format, colour='green', ncols=terminal_width - 20)
+                with print_lock:
+                    pbar = tqdm(total=total_devices, desc="🔍 QA巡检数据采集进度", unit="台",
+                                bar_format=bar_format, colour='green', ncols=terminal_width - 20)
 
                 # 初始化完成计数和锁
                 completed_count = 0
@@ -5610,11 +5941,10 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
                                     hours = int(total_minutes // 60)
                                     minutes = int(total_minutes % 60)
                                     eta_info = f" | 预计耗时: {hours}小时{minutes}分钟"
-
-                            print(
-                                f"{Fore.BLUE}[PROGRESS] [{progress_bar}] {current_count}/{total_devices} "
-                                f"({current_count/total_devices*100:.1f}%) | "
-                                f"已用时: {elapsed_time:.0f}秒 | 剩余:{total_devices - current_count}台{eta_info}{Style.RESET_ALL}")
+                            with print_lock:
+                                print(f"{Fore.BLUE}[PROGRESS] [{progress_bar}] {current_count}/{total_devices} "
+                                      f"({current_count/total_devices*100:.1f}%) | "
+                                      f"已用时: {elapsed_time:.0f}秒 | 剩余:{total_devices - current_count}台{eta_info}{Style.RESET_ALL}")
 
                             # 如果任务完成，退出循环
                             if current_count >= total_devices:
@@ -5637,8 +5967,9 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
                         ip = row[0].strip()
                         user = row[1].strip()
                         pwd = row[2].strip()
+                        # 调用修改后的 process_custom_commands 函数，保持PC时间功能
                         futures.append(executor.submit(
-                            process_multiple_cmds_device, ip, user, pwd, commands, writer, fail_log))
+                            process_custom_commands, ip, user, pwd, commands, writer, fail_log))
 
                     # 更新完成计数的函数
                     def update_completed_count():
@@ -5652,21 +5983,7 @@ def fish_multiple_cmds(host_file, raw_file, commands, max_workers=40):
                                 result = future.result()
                                 with progress_lock:
                                     current_completed = update_completed_count()
-
                                 pbar.update(1)
-
-                                # 立即打印当前完成的设备
-                                # if result:
-                                #     current_time = time.time()
-                                #     elapsed_time = current_time - start_time
-                                #     progress_bar_length = terminal_width - 80
-                                #     progress_bar = "█" * int(current_completed / total_devices * progress_bar_length)
-                                #     progress_bar += "░" * (progress_bar_length - len(progress_bar))
-
-                                #     print(f"{Fore.GREEN}[COMPLETED] 设备 {result} 处理完成 | "
-                                #           f"进度: [{progress_bar}] {current_completed}/{total_devices} "
-                                #           f"({current_completed/total_devices*50:.1f}%) | "
-                                #           f"已用时: {elapsed_time:.0f}秒{Style.RESET_ALL}")
 
                             except Exception as e:
                                 with progress_lock:
@@ -6519,23 +6836,26 @@ def parse_ospf_routing_table(output):
     lines = output.split('\n')
     routing_section = False
 
-    # 正则表达式匹配路由表行
+    # 改进的正则表达式，更好地处理空格和接口名
     route_pattern = re.compile(
-        r'(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+([\w\s/\.]+)\s+(\S+)'
+        r'(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(.*?)\s+(\S+)$'
     )
 
     def parse_uptime(uptime):
         """将uptime字符串转换为秒数"""
         if ':' in uptime:
-            # 处理“HH:MM:SS”格式
+            # 处理"HH:MM:SS"格式
             parts = uptime.split(':')
             if len(parts) == 3:
-                hours, minutes, seconds = map(int, parts)
-                return hours * 3600 + minutes * 60 + seconds
+                try:
+                    hours, minutes, seconds = map(int, parts)
+                    return hours * 3600 + minutes * 60 + seconds
+                except ValueError:
+                    return 0
             else:
-                return 0  # 格式不正确
+                return 0
         else:
-            # 处理“1w2d3h4m5s”格式
+            # 处理"1w2d3h4m5s"格式
             units = {'w': 604800, 'd': 86400, 'h': 3600, 'm': 60, 's': 1}
             uptime_secs = 0
             pattern = re.compile(r'(\d+)([wdhms])')
@@ -6544,52 +6864,97 @@ def parse_ospf_routing_table(output):
                 uptime_secs += int(num) * units.get(unit, 0)
             return uptime_secs
 
-    for line in lines:
+    print(f"[DEBUG] 开始解析OSPF路由表，总行数: {len(lines)}")
+
+    for i, line in enumerate(lines):
         line = line.strip()
-        if line.startswith('------'):
-            routing_section = True
-            continue
-        if not routing_section or not line:
+
+        # 跳过空行
+        if not line:
             continue
 
+        # 寻找分隔线，表示路由表开始
+        if '---' in line or 'Destination/Mask' in line:
+            routing_section = True
+            # print(f"[DEBUG] 第{i}行找到路由表开始标志: {line[:50]}...")
+            continue
+
+        if not routing_section:
+            continue
+
+        # 跳过表头行
+        if 'Destination/Mask' in line or 'Proto' in line:
+            # print(f"[DEBUG] 跳过表头行: {line}")
+            continue
+
+        # 尝试匹配路由行
         match = route_pattern.search(line)
         if match:
             dest_mask, proto, pre, cost, nexthop, interface, uptime = match.groups()
+
+            # 清理接口名（去除多余空格）
+            interface = ' '.join(interface.split())
+
+            # print(f"[DEBUG] 匹配到路由: {dest_mask} - {proto} - Cost: {cost}")
+
             # 只处理 OSPF 相关协议
-            if 'OSPF' not in proto:
+            if 'OSPF' not in proto and 'ospf' not in proto.lower():
+                # print(f"[DEBUG] 跳过非OSPF路由: {proto}")
                 continue
 
             # 检查规则
             remarks = []
-            cost_val = int(cost)
-            uptime_secs = parse_uptime(uptime)
+            try:
+                cost_val = int(cost)
+                uptime_secs = parse_uptime(uptime)
 
-            # 规则检查
-            if cost_val > 4000:
-                remarks.append(f"Cost值过高（{cost_val} > 6000），可能导致次优路径选择或环路")
-            if uptime_secs < 3600:  # 小于1小时
-                uptime_str = str(timedelta(seconds=uptime_secs))
-                remarks.append(f"Uptime < 1小时（{uptime_str}），区域内OSPF有刷新")
+                # 规则检查
+                if cost_val > 18000:
+                    remarks.append(
+                        f"Cost值过高（{cost_val} > 18000），可能导致次优路径选择或环路")
+                if uptime_secs < 3600:  # 小于1小时
+                    uptime_str = str(timedelta(seconds=uptime_secs))
+                    remarks.append(f"Uptime < 1小时（{uptime_str}），区域内OSPF有刷新")
 
-            # 只有异常的条目才加入结果
-            if remarks:
-                route = {
-                    "目的网络/掩码": dest_mask,
-                    "协议": proto,
-                    "优先级": pre,
-                    "开销": cost,
-                    "下一跳": nexthop,
-                    "接口": interface.strip(),
-                    "存活时间": uptime,  # 保留原始格式
-                    "Result": "normal",  # 按要求状态为 normal
-                    "备注": "; ".join(remarks)
-                }
-                routes.append(route)
+                # 只有异常的条目才加入结果
+                if remarks:
+                    route = {
+                        "目的网络/掩码": dest_mask,
+                        "协议": proto,
+                        "优先级": pre,
+                        "开销": cost,
+                        "下一跳": nexthop,
+                        "接口": interface.strip(),
+                        "存活时间": uptime,
+                        "Result": "normal",
+                        "备注": "; ".join(remarks)
+                    }
+                    routes.append(route)
+                    # print(
+                    #     f"[DEBUG] 添加异常路由: {dest_mask} - {'; '.join(remarks)}")
+                # else:
+                    # print(f"[DEBUG] 路由正常，不添加: {dest_mask}")
 
-    # 如果没有路由条目
-    if not routes and routing_section:
+            except ValueError as e:
+                print(f"[DEBUG] 解析数值失败: {line}, 错误: {e}")
+                continue
+        else:
+            # 如果不匹配，打印调试信息
+            if len(line) > 10 and not line.startswith(('Codes:', 'Routing count:', 'RIP', 'BGP', 'OSPF', 'ISIS', 'Total')):
+                print(f"[DEBUG] 未匹配的行: {line}")
+
+    print(f"[DEBUG] 解析完成，找到 {len(routes)} 个异常路由")
+
+    # 如果没有异常路由但有路由数据，返回空列表（表示有数据但都正常）
+    # 如果完全没有找到路由数据，返回无条目标识
+    if not routes and not routing_section:
+        print("[DEBUG] 没有找到路由表数据")
         return [{"目的网络/掩码": "无条目"}]
-    return routes if routes else []
+    elif not routes and routing_section:
+        print("[DEBUG] 有路由表但没有异常条目")
+        return []
+
+    return routes
 
 
 def parse_ldp_session_status(output):
@@ -6598,52 +6963,118 @@ def parse_ldp_session_status(output):
     lines = output.split('\n')
     session_section = False
 
-    # 正则表达式匹配会话条目，vc字段可选
-    session_pattern = re.compile(
-        r'(\S+)\s+(vc\s+)?(\d+\.\d+\.\d+\.\d+)\s+(\S+(?:\s+\S+)*?)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)'
-    )
+    print(f"[DEBUG] 开始解析LDP会话输出...")
+    print(f"[DEBUG] 输出内容: {output[:200]}...")
 
-    for line in lines:
+    for i, line in enumerate(lines):
         line = line.strip()
+        print(f"[DEBUG] 处理行 {i}: '{line}'")
+
+        # 找到表头行
         if line.startswith('Peer_type'):
             session_section = True
+            print(f"[DEBUG] 找到表头行，开始解析会话数据")
             continue
+
         if not session_section or not line:
             continue
 
-        # 尝试匹配会话行
-        match = session_pattern.search(line)
-        if match:
-            peer_type, vc, peer_ip, interface, role, state, keepalive, uptime = match.groups()
-            # 动态确定对端类型
-            if vc:
-                peer_type_full = f"{peer_type} {vc.strip()}"
+        # 跳过汇总信息行
+        if any(keyword in line for keyword in ['Total number:', 'OPERATIONAL    :', 'NON OPERATIONAL:']):
+            print(f"[DEBUG] 跳过汇总行: {line}")
+            continue
+
+        # 使用IP地址作为锚点解析数据行
+        import re
+        ip_match = re.search(r'\b(\d+\.\d+\.\d+\.\d+)\b', line)
+        if not ip_match:
+            print(f"[DEBUG] 行中未找到IP地址，跳过: {line}")
+            continue
+
+        ip_start = ip_match.start()
+        ip_end = ip_match.end()
+        peer_ip = ip_match.group(1)
+
+        # peer_type 是IP地址之前的所有内容（去除首尾空白）
+        peer_type = line[:ip_start].strip()
+
+        # 剩余部分是IP地址之后的内容
+        remaining = line[ip_end:].strip()
+        print(f"[DEBUG] 解析字段 - Peer_type: '{peer_type}', Peer_IP: '{peer_ip}', 剩余: '{remaining}'")
+
+        # 从右往左解析，因为接口名称可能包含空格
+        parts = remaining.split()
+        print(f"[DEBUG] 剩余部分分割后: {parts}")
+
+        # 判断是否有UpTime字段（通过检查最后一个字段是否为时间格式或"-"）
+        has_uptime = False
+        if parts:
+            last_field = parts[-1]
+            # 如果最后一个字段包含冒号或是"-"，说明有UpTime字段
+            if ':' in last_field or last_field == '-':
+                has_uptime = True
+
+        if has_uptime:
+            # 有UpTime的格式：接口名 角色 状态 KeepAlive UpTime
+            if len(parts) < 4:
+                print(f"[DEBUG] 字段数量不足，跳过该行: {len(parts)} < 4")
+                continue
+            
+            uptime = parts[-1]
+            keepalive = parts[-2]
+            state = parts[-3]
+            role = parts[-4]
+            
+            # 找到role在remaining中的位置来提取接口名
+            role_pos = remaining.find(role)
+            if role_pos > 0:
+                interface = remaining[:role_pos].strip()
             else:
-                peer_type_full = peer_type
+                interface = "-"
+        else:
+            # 没有UpTime的格式：接口名 角色 状态 KeepAlive
+            if len(parts) < 3:
+                print(f"[DEBUG] 字段数量不足，跳过该行: {len(parts)} < 3")
+                continue
+            
+            uptime = "-"
+            keepalive = parts[-1]
+            state = parts[-2]
+            role = parts[-3]
+            
+            # 找到role在remaining中的位置来提取接口名
+            role_pos = remaining.find(role)
+            if role_pos > 0:
+                interface = remaining[:role_pos].strip()
+            else:
+                interface = "-"
 
-            # 检查会话状态，设置 Result
-            result = "normal" if state == "OPERATIONAL" else "error"
+        print(f"[DEBUG] 解析结果 - 接口: '{interface}', 角色: '{role}', 状态: '{state}', KeepAlive: '{keepalive}', 运行时间: '{uptime}'")
 
-            # 设置备注
-            remark = "会话正常" if result == "normal" else f"会话状态异常: {state}"
+        # 检查会话状态，设置 Result
+        # OPERATIONAL 是正常状态，其他状态（如 NON_EXISTENT）是异常
+        result = "normal" if state == "OPERATIONAL" else "error"
 
-            session = {
-                "对端类型": peer_type_full,
-                "对端IP": peer_ip,
-                "接口名称": interface.strip(),
-                "角色": role,
-                "会话状态": state,
-                "KeepAlive时间": f"{keepalive}s",
-                "运行时间": uptime,
-                "Result": result,
-                "备注": remark
-            }
-            sessions.append(session)
+        # 设置备注
+        remark = "会话正常" if result == "normal" else f"会话状态异常: {state}"
 
-    # 如果没有会话条目，返回"无会话"
-    if not sessions:
-        sessions = [{"对端IP": "无会话"}]
+        session = {
+            "对端类型": peer_type,
+            "对端IP": peer_ip,
+            "接口名称": interface,
+            "角色": role,
+            "会话状态": state,
+            "KeepAlive时间": f"{keepalive}(s)",
+            "运行时间": uptime,
+            "Result": result,
+            "备注": remark
+        }
+        sessions.append(session)
+        print(f"[DEBUG] 添加会话: {session}")
 
+    print(f"[DEBUG] 总共解析到 {len(sessions)} 个LDP会话")
+
+    # 返回空列表表示无会话，而不是返回特殊的标记
     return sessions
 
 
@@ -7408,39 +7839,125 @@ def parse_ospf_session(output):
 
 def parse_mpls_lsp(output):
     lsps = []
-    # Pre-split lines and filter out irrelevant ones
-    lines = [line.strip() for line in output.splitlines() if line.strip(
-    ) and not line.startswith(('Dest LsrId', '------------------'))]
+    # 更完善的过滤逻辑，过滤掉所有非数据行
+    lines = output.splitlines()
 
     for line in lines:
-        parts = line.split()
-        if len(parts) < 8:  # Skip malformed lines
+        line = line.strip()
+
+        # 跳过空行
+        if not line:
             continue
 
-        # Extract fields efficiently
-        dest_lsr_id = parts[0]
-        lsp_type = parts[1]
-        description = parts[2]
-        state = parts[3]
-        in_label = parts[4]
-        out_label = parts[5]
-        nexthop_ip = parts[-1]
-        # Handle out_intf efficiently
-        out_intf = parts[6] if len(parts) == 8 else " ".join(
-            parts[6:-1]) if len(parts) > 8 else "-"
+        # 跳过标题行（多种可能的格式）
+        if any(keyword in line.upper() for keyword in ['DEST', 'LSRID', 'TYPE', 'DESCRIPTION', 'STAT', 'INLABEL', 'OUTLABEL', 'OUTINTF', 'NEXTHOP']):
+            print(f"[DEBUG] 跳过标题行: {line}")
+            continue
 
-        lsps.append({
-            'dest_lsr_id': dest_lsr_id,
-            'type': lsp_type,
-            'description': description,
-            'state': state,
-            'in_label': in_label,
-            'out_label': out_label,
-            'out_intf': out_intf,
-            'nexthop_ip': nexthop_ip
-        })
+        # 跳过分隔线
+        if line.startswith('-') or all(c in '-= |' for c in line):
+            print(f"[DEBUG] 跳过分隔线: {line}")
+            continue
 
+        # 跳过包含 "error" 但不是有效数据的行
+        if line.endswith('error') and ('LSP状态为down' in line or '需检查' in line):
+            print(f"[DEBUG] 跳过错误提示行: {line}")
+            continue
+
+        # 检查是否为有效的LSP数据行
+        parts = line.split()
+        if len(parts) < 6:  # LSP数据至少应该有6个字段
+            print(f"[DEBUG] 跳过字段不足的行: {line}")
+            continue
+
+        # 验证第一个字段是否像IP地址或LSR ID
+        if not is_valid_lsr_id_or_ip(parts[0]):
+            print(f"[DEBUG] 跳过无效LSR ID的行: {line}")
+            continue
+
+        # 提取LSP数据
+        try:
+            dest_lsr_id = parts[0]
+            lsp_type = parts[1]
+            description = parts[2]
+            state = parts[3]
+            in_label = parts[4]
+            out_label = parts[5]
+
+            # 处理接口字段和下一跳IP
+            if len(parts) == 8:
+                out_intf = parts[6]
+                nexthop_ip = parts[7]
+            elif len(parts) > 8:
+                # 接口名可能包含空格，需要重新组合
+                nexthop_ip = parts[-1]
+                out_intf = " ".join(parts[6:-1])
+            else:
+                out_intf = "-"
+                nexthop_ip = parts[-1] if len(parts) > 6 else "-"
+
+            lsps.append({
+                'dest_lsr_id': dest_lsr_id,
+                'type': lsp_type,
+                'description': description,
+                'state': state,
+                'in_label': in_label,
+                'out_label': out_label,
+                'out_intf': out_intf,
+                'nexthop_ip': nexthop_ip
+            })
+
+            # print(f"[DEBUG] 成功解析LSP: {dest_lsr_id} - {state}")
+
+        except Exception as e:
+            print(f"[DEBUG] 解析LSP数据时出错: {line}, 错误: {e}")
+            continue
+
+    print(f"[DEBUG] 总共解析到 {len(lsps)} 个有效LSP")
     return lsps
+
+
+def is_valid_lsr_id_or_ip(value):
+    """检查是否为有效的LSR ID或IP地址"""
+    try:
+        # 检查是否为IP地址格式
+        parts = value.split('.')
+        if len(parts) == 4:
+            for part in parts:
+                num = int(part)
+                if 0 <= num <= 255:
+                    continue
+                else:
+                    return False
+            return True
+    except:
+        pass
+
+    # 检查是否为其他有效的LSR ID格式（可根据实际情况调整）
+    if len(value) > 3 and not value.upper().startswith(('DEST', 'TYPE', 'STAT')):
+        return True
+
+    return False
+
+
+def check_mpls_lsp(lsp):
+    """检查MPLS LSP状态"""
+    result = "normal"
+    suggestions = "-"
+
+    # 检查LSP状态
+    if lsp['state'].lower() in ['down', 'inactive', 'failed']:
+        result = "error"
+        suggestions = "❗ LSP状态为down，需检查LDP邻居会话和接口状态"
+    elif lsp['state'].lower() in ['up', 'active']:
+        result = "normal"
+        suggestions = "LSP状态正常"
+    else:
+        # 对于未知状态，标记为警告
+        result = "warning"
+        suggestions = f"⚠️ LSP状态未知: {lsp['state']}，建议检查"
+
+    return result, suggestions
 
 
 def check_mpls_lsp(lsp):
@@ -7724,6 +8241,40 @@ def parse_bfd_sessions(brief_output, config_output, l2vc_output, ldp_detail_outp
 
     return sessions
 
+def parse_l2vc_summary(l2vc_output):
+    """解析show mpls l2vc brief命令输出，提取VC总数、UP数、DOWN数"""
+    total_vc = 0
+    up_count = 0
+    down_count = 0
+    
+    lines = l2vc_output.split('\n')
+    for line in lines:
+        line = line.strip()
+        # 查找格式: Total LDP VC : 2, 2 up, 0 down
+        if line.startswith('Total LDP VC'):
+            try:
+                # 提取总数
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    counts_part = parts[1].strip()
+                    # 分割成 "2, 2 up, 0 down"
+                    count_parts = counts_part.split(',')
+                    if len(count_parts) >= 1:
+                        total_vc = int(count_parts[0].strip())
+                    if len(count_parts) >= 2:
+                        up_match = count_parts[1].strip().split()
+                        if len(up_match) >= 1:
+                            up_count = int(up_match[0])
+                    if len(count_parts) >= 3:
+                        down_match = count_parts[2].strip().split()
+                        if len(down_match) >= 1:
+                            down_count = int(down_match[0])
+            except (ValueError, IndexError) as e:
+                print(f"解析VC统计信息时出错: {e}")
+                pass
+            break
+    
+    return total_vc, up_count, down_count
 
 def parse_ldp_l2vc_detail(ldp_detail_output):
     """解析show ldp l2vc detail命令输出，返回按VCID索引的详细信息"""
@@ -8014,18 +8565,52 @@ def parse_cfgchk_info(output):
     }
 
 
-def parse_ntp_status(cloc_output, ntp_output):
-    # 提取采集时的PC时间
-    pc_time_match = re.search(
-        r'PC_TIME: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', cloc_output)
-    if pc_time_match:
-        pc_time = datetime.strptime(
-            pc_time_match.group(1), '%Y-%m-%d %H:%M:%S')
-    else:
-        pc_time = datetime.now()  # 回退方案
-        print(f"[WARNING] 未找到PC_TIME，使用当前时间: {pc_time}")
+def execute_command_with_timestamp(ip, command):
+    """
+    执行命令并记录PC时间戳
+    这个函数应该在数据采集阶段使用
+    """
+    pc_time = datetime.now()
 
-    # 解析 'show cloc' 输出
+    # 执行实际命令的代码（这里需要替换为实际的命令执行逻辑）
+    result = ""  # 这里应该是实际命令执行的结果
+    # 例如：result = ssh_execute_command(ip, command) 或其他执行方式
+
+    # 在命令输出前添加PC时间戳
+    timestamped_output = f"PC_EXEC_TIME: {pc_time.strftime('%Y-%m-%d %H:%M:%S')}\n" + result
+    return timestamped_output
+
+# 修复后的解析函数
+
+
+def extract_pc_time(output):
+    """
+    从命令输出中提取PC_TIME
+    """
+    pc_time_match = re.search(r'PC_TIME:\s*(.+)', output)
+    if pc_time_match:
+        try:
+            pc_time = datetime.strptime(pc_time_match.group(1).strip(), '%Y-%m-%d %H:%M:%S')
+            return pc_time
+        except ValueError as e:
+            print(f"{Fore.YELLOW}[WARNING] PC_TIME解析失败: {e}{Style.RESET_ALL}")
+    return None
+
+def parse_ntp_status(cloc_output, ntp_output, pc_time=None):
+    """
+    解析NTP状态，使用提供的PC时间计算偏差
+    如果没有提供pc_time，尝试从输出中提取
+    """
+    # 如果没有提供PC时间，尝试从输出中提取
+    if pc_time is None:
+        pc_time = extract_pc_time(cloc_output)
+        if pc_time is None:
+            pc_time = extract_pc_time(ntp_output)
+        if pc_time is None:
+            print(f"{Fore.YELLOW}[WARNING] 无法从输出中提取PC_TIME，使用当前时间{Style.RESET_ALL}")
+            pc_time = datetime.now()
+    
+    # 解析设备本地时间
     local_time_str = re.search(r'LOCAL TIME\s*:\s*(.+)', cloc_output)
     utc_time_str = re.search(r'UTC TIME\s*:\s*(.+)', cloc_output)
     time_zone_str = re.search(r'TIME-Zone\s*:\s*(.+)', cloc_output)
@@ -8035,8 +8620,9 @@ def parse_ntp_status(cloc_output, ntp_output):
         try:
             local_time = datetime.strptime(
                 local_time_str.group(1).strip(), '%Y-%m-%d %H:%M:%S')
+            print(f"[DEBUG] 设备本地时间: {local_time}")
         except ValueError as e:
-            print(f"[DEBUG] Failed to parse local time: {e}")
+            print(f"[ERROR] 设备本地时间解析失败: {e}")
 
     utc_time = None
     if utc_time_str:
@@ -8044,22 +8630,36 @@ def parse_ntp_status(cloc_output, ntp_output):
             utc_time = datetime.strptime(
                 utc_time_str.group(1).strip(), '%Y-%m-%d %H:%M:%S')
         except ValueError as e:
-            print(f"[DEBUG] Failed to parse UTC time: {e}")
+            print(f"[DEBUG] UTC时间解析失败: {e}")
 
     time_zone = time_zone_str.group(1).strip() if time_zone_str else "-"
 
     # 计算时间偏差
     result = "error"
-    time_deviation = "-"
-    if local_time and pc_time:
+    time_deviation = "无法计算"
+    pc_time_str = pc_time.strftime('%Y-%m-%d %H:%M:%S')
+
+    if local_time:
+        # 计算时间差（秒）
         time_diff = abs((local_time - pc_time).total_seconds())
         time_deviation = f"{time_diff:.0f}(s)"
-        print(
-            f"[DEBUG] Device local time: {local_time}, PC time: {pc_time}, Diff: {time_diff} sec")
-        if time_diff <= 60:
-            result = "normal"
 
-    # 解析 'show ntp-service' 输出
+        print(f"[DEBUG] PC执行时间: {pc_time}")
+        print(f"[DEBUG] 设备本地时间: {local_time}")
+        print(f"[DEBUG] 时间偏差: {time_diff} 秒")
+
+        # 基于时间偏差判断
+        if time_diff <= 60:  # 60秒内为正常
+            result = "normal"
+        elif time_diff <= 300:  # 5分钟内为警告
+            result = "warning"
+        else:  # 超过5分钟为错误
+            result = "error"
+    else:
+        time_deviation = "缺少设备时间"
+        result = "error"
+
+    # 解析NTP服务配置
     ntp_enable = re.search(r'ntp enable\s*:\s*(.+)', ntp_output)
     ntp_status = re.search(r'ntp clock status\s*:\s*(.+)', ntp_output)
     ntp_syn_interval = re.search(r'ntp syn-interval\s*:\s*(.+)', ntp_output)
@@ -8084,10 +8684,9 @@ def parse_ntp_status(cloc_output, ntp_output):
         "local_time": local_time.strftime('%Y-%m-%d %H:%M:%S') if local_time else "-",
         "utc_time": utc_time.strftime('%Y-%m-%d %H:%M:%S') if utc_time else "-",
         "time_zone": time_zone,
-        "pc_time": pc_time.strftime('%Y-%m-%d %H:%M:%S'),
+        "pc_time": pc_time_str,
         "result": result
     }
-
 
 def parse_flash_usage(output):
     """解析 'show flash-usage' 输出以获取硬盘资源占用状态"""
@@ -8117,10 +8716,11 @@ def parse_flash_usage(output):
     }
 
 
-def parse_main_backup_version(output):
-    """Parse 'show device' output for main and backup control board software version consistency."""
-    print(
-        f"{Fore.CYAN}[DEBUG] 开始解析 'show device' 输出以检查主备主控软件版本一致性{Style.RESET_ALL}")
+def parse_main_backup_version(output, ip_address=None):
+    """Parse output for main and backup control board software version consistency."""
+    # print(f"{Fore.CYAN}[DEBUG] 开始解析输出以检查主备主控软件版本一致性{Style.RESET_ALL}")
+    # print(f"{Fore.CYAN}[DEBUG] 设备IP: {ip_address}{Style.RESET_ALL}")
+    # print(f"{Fore.CYAN}[DEBUG] 输入原始数据:\n{output}\n{Style.RESET_ALL}")
     lines = output.split('\n')
     ne_type = None
     device_name = None
@@ -8130,77 +8730,114 @@ def parse_main_backup_version(output):
 
     for i, line in enumerate(lines):
         line = line.strip()
+        # print(f"{Fore.BLUE}[DEBUG] 处理行 {i}: '{line}'{Style.RESET_ALL}")
 
-        # 提取设备名称
+        # 提取设备名称（如果存在）
         if line.startswith('<') and line.endswith('>'):
             device_name = line[1:-1]
-            print(
-                f"{Fore.YELLOW}[DEBUG] 提取设备名称: {device_name}{Style.RESET_ALL}")
+            # print(
+            # f"{Fore.YELLOW}[DEBUG] 从<...>提取设备名称: {device_name}{Style.RESET_ALL}")
+            # 从设备名称初步推断网元类型
+            if re.search(r'MssEdge\s*20\s*-?\s*A3', device_name):
+                ne_type = "MssEdge 20 A3"
+            elif re.search(r'MssEdge\s*20\s*-?\s*A2', device_name):
+                ne_type = "MssEdge 20 A2"
+            elif re.search(r'MssEdge\s*20(\s*-?\s*A1)?', device_name):
+                ne_type = "MssEdge 20 A1"
+            elif re.search(r'MssEdge\s*25\s*-?\s*S10-3', device_name):
+                ne_type = "MssEdge 25 S10-3"
+            elif re.search(r'MssEdge\s*25\s*-?\s*S10', device_name):
+                ne_type = "MssEdge 25 S10"
+            # print(
+                # f"{Fore.YELLOW}[DEBUG] 从设备名称初始提取网元类型: {ne_type or '-'}{Style.RESET_ALL}")
 
-        # 提取网元类型
+        # 从stn-standard-reserved后面的行获取网元类型信息
         if "stn-standard-reserved" in line:
             if i + 1 < len(lines):
                 ne_type_full = lines[i + 1].strip()
-                ne_type = ne_type_full.split(',')[0].strip(
-                ) if ',' in ne_type_full else ne_type_full
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 提取网元类型: {ne_type}{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] stn-standard-reserved 下一行: {ne_type_full}{Style.RESET_ALL}")
 
-        # 解析系统信息 - 改进的解析逻辑
+                # 改进的网元类型匹配逻辑
+                if 'MssEdge 25 S10-3' in ne_type_full:
+                    ne_type = "MssEdge 25 S10-3"
+                elif 'MssEdge 25 S10' in ne_type_full and 'S10-3' not in ne_type_full:
+                    ne_type = "MssEdge 25 S10"
+                elif 'MssEdge20-A3' in ne_type_full or 'MssEdge 20-A3' in ne_type_full:
+                    ne_type = "MssEdge 20 A3"
+                elif 'MssEdge20-A2' in ne_type_full or 'MssEdge 20-A2' in ne_type_full:
+                    ne_type = "MssEdge 20 A2"
+                elif 'MssEdge20' in ne_type_full or 'MssEdge 20' in ne_type_full:
+                    ne_type = "MssEdge 20 A1"
+
+                print(
+                    f"{Fore.YELLOW}[DEBUG] 从stn-standard-reserved更新网元类型: {ne_type or '-'}{Style.RESET_ALL}")
+
+        # 从system name提取设备名称（作为备用方案）
+        if device_name is None and line.startswith('system name'):
+            system_name = line.split(':', 1)[1].strip()
+            if system_name and system_name != "OPTEL":  # 排除默认值
+                device_name = system_name
+                print(
+                    f"{Fore.YELLOW}[DEBUG] 从system name提取设备名称: {device_name}{Style.RESET_ALL}")
+
+        # 解析版本信息
         if line.startswith('system info'):
             system_info = line.split(':', 1)[1].strip()
-            print(
-                f"{Fore.BLUE}[DEBUG] 原始系统信息: '{system_info}'{Style.RESET_ALL}")
+            # print(
+            #     f"{Fore.BLUE}[DEBUG] 原始系统信息: '{system_info}'{Style.RESET_ALL}")
 
-            # 尝试匹配标准格式: O123456789 (123456789)
+            # 匹配标准格式: O123456789 (123456789)
             match = re.search(r'O(\d+)\s*\((\d+)\)', system_info)
             if match:
                 main_version, backup_version = match.groups()
-                if main_version == backup_version:
-                    result = "normal"
-                else:
-                    result = "error"
-                print(
-                    f"{Fore.YELLOW}[DEBUG] 标准格式匹配: 主用={main_version}, 备用={backup_version}, Result={result}{Style.RESET_ALL}")
+                result = "normal" if main_version == backup_version else "error"
+                # print(
+                #     f"{Fore.YELLOW}[DEBUG] 标准格式匹配: 主用={main_version}, 备用={backup_version}, Result={result}{Style.RESET_ALL}")
             else:
-                # 尝试匹配异常格式: O123456789uptime: 或其他变体
-                alt_match = re.search(r'O(\d+)(?:uptime:|$)', system_info)
+                # 匹配单版本格式（修正的逻辑）
+                alt_match = re.search(
+                    r'O(\d+)(?:uptime:|$|\s*\(\s*\))', system_info)
                 if alt_match:
                     version_number = alt_match.group(1)
                     main_version = version_number
-                    backup_version = version_number  # 假设主备版本相同
-                    result = "normal"  # 由于只有一个版本号，假设一致
+                    backup_version = "-"  # 修正：单版本时备用设为"-"
+                    result = "error"      # 修正：单版本时状态设为"error"
                     print(
-                        f"{Fore.YELLOW}[DEBUG] 异常格式匹配: 版本={version_number}, 假设主备一致, Result={result}{Style.RESET_ALL}")
+                        f"{Fore.RED}[DEBUG] 单版本格式匹配: 主用={main_version}, 备用={backup_version}, Result={result}{Style.RESET_ALL}")
                 else:
-                    # 尝试提取任何数字序列
+                    # 提取任何数字序列作为后备方案
                     number_match = re.search(r'O?(\d+)', system_info)
                     if number_match:
                         version_number = number_match.group(1)
                         main_version = version_number
-                        backup_version = "-"  # 无法确定备用版本
-                        result = "error"  # 无法确定版本一致性
+                        backup_version = "-"
+                        result = "error"
                         print(
                             f"{Fore.RED}[DEBUG] 部分匹配: 主用={version_number}, 备用=未知, Result={result}{Style.RESET_ALL}")
                     else:
                         print(
                             f"{Fore.RED}[DEBUG] 无法解析系统信息: '{system_info}'{Style.RESET_ALL}")
 
-    # 设置默认值
-    if not ne_type:
-        ne_type = "-"
-    if not device_name:
-        device_name = "-"
-    if not main_version or not backup_version:
-        if not main_version:
-            main_version = "-"
-        if not backup_version:
-            backup_version = "-"
-        if main_version == "-" or backup_version == "-":
-            result = "error"
+    # 如果没有从<>中获取到设备名称，生成一个基于IP的设备名称
+    if device_name is None or device_name == "-":
+        if ip_address and ne_type and ne_type != "-":
+            # 使用IP地址和网元类型生成设备名称
+            device_name = f"{ne_type.replace(' ', '-')}-{ip_address}"
+            print(
+                f"{Fore.YELLOW}[DEBUG] 基于IP生成设备名称: {device_name}{Style.RESET_ALL}")
+        else:
+            device_name = "-"
 
-    print(f"{Fore.GREEN}[DEBUG] 最终结果: NE类型={ne_type}, 设备名={device_name}, 主用={main_version}, 备用={backup_version}, 状态={result}{Style.RESET_ALL}")
+    # 设置默认值并确保结果一致性
+    ne_type = ne_type or "-"
+    device_name = device_name or "-"
+    main_version = main_version or "-"
+    backup_version = backup_version or "-"
+    if main_version == "-" or backup_version == "-":
+        result = "error"
 
+    # print(f"{Fore.GREEN}[DEBUG] 最终结果: NE类型={ne_type}, 设备名={device_name}, 主用={main_version}, 备用={backup_version}, 状态={result}{Style.RESET_ALL}")
     return (ne_type, device_name, main_version, backup_version, result)
 
 
@@ -8210,84 +8847,135 @@ def parse_board_cpu_memory(output_15m, output_24h):
     results = []
 
     def parse_pm_output(output, time_frame):
+        if not output or not output.strip():
+            print(f"{Fore.YELLOW}[WARNING] {time_frame}性能监控输出为空{Style.RESET_ALL}")
+            return []
+            
         lines = output.split('\n')
         in_table = False
         data = []
+        
         for line in lines:
             line = line.strip()
+            if not line:
+                continue
+                
+            # 检测表头
             if line.startswith('Index') and 'PM-Source' in line:
                 in_table = True
                 continue
+                
+            # 跳过分隔符行
             if line.startswith('---'):
                 continue
+                
             if in_table and line:
                 parts = line.split()
-                if len(parts) >= 5:
-                    pm_source = parts[1]
-                    time = parts[2] + ' ' + parts[3]
-                    temp = parts[4]
-                    cpu_rate = parts[5] + \
-                        '%' if '%' not in parts[5] else parts[5]
-                    mem_rate = parts[6] + \
-                        '%' if '%' not in parts[6] else parts[6]
-                    result = "normal"
+                print(f"{Fore.CYAN}[DEBUG] {time_frame} 解析行: {line} (字段数: {len(parts)}){Style.RESET_ALL}")
+                
+                # 检查是否有足够的字段（至少需要7个字段：Index, PM-Source, Time(2个), Temp, CPU, Memory）
+                if len(parts) >= 7:
                     try:
-                        temp_val = float(temp)
-                        cpu_val = float(cpu_rate.rstrip('%'))
-                        mem_val = float(mem_rate.rstrip('%'))
-                        if temp_val > 80 or cpu_val > 60 or mem_val > 65:
+                        pm_source = parts[1]
+                        time = parts[2] + ' ' + parts[3]  # 合并日期和时间
+                        temp = parts[4]
+                        cpu_rate = parts[5]
+                        mem_rate = parts[6]
+                        
+                        # 确保百分号存在
+                        if '%' not in cpu_rate:
+                            cpu_rate += '%'
+                        if '%' not in mem_rate:
+                            mem_rate += '%'
+                        
+                        # 判断是否正常
+                        result = "normal"
+                        try:
+                            # 去除可能的非数字字符进行数值解析
+                            temp_str = temp.replace('°C', '').replace('C', '')
+                            temp_val = float(temp_str)
+                            cpu_val = float(cpu_rate.rstrip('%'))
+                            mem_val = float(mem_rate.rstrip('%'))
+                            
+                            if temp_val > 80 or cpu_val > 60 or mem_val > 65:
+                                result = "error"
+                                print(f"{Fore.YELLOW}[DEBUG] {time_frame} {pm_source}: 温度={temp_val}°C, CPU={cpu_val}%, 内存={mem_val}%, Result=error{Style.RESET_ALL}")
+                            else:
+                                print(f"{Fore.GREEN}[DEBUG] {time_frame} {pm_source}: 温度={temp_val}°C, CPU={cpu_val}%, 内存={mem_val}%, Result=normal{Style.RESET_ALL}")
+                                
+                        except (ValueError, TypeError) as e:
                             result = "error"
-                            print(
-                                f"{Fore.YELLOW}[DEBUG] {time_frame} {pm_source}: 温度={temp_val}°C, CPU={cpu_val}%, 内存={mem_val}%, Result=error{Style.RESET_ALL}")
-                        else:
-                            print(
-                                f"{Fore.YELLOW}[DEBUG] {time_frame} {pm_source}: 温度={temp_val}°C, CPU={cpu_val}%, 内存={mem_val}%, Result=normal{Style.RESET_ALL}")
-                    except ValueError:
-                        result = "error"
-                        print(
-                            f"{Fore.YELLOW}[WARNING] {time_frame} {pm_source} 数据解析失败，Result=error{Style.RESET_ALL}")
-                    data.append({
-                        "pm_source": pm_source,
-                        "time": time,
-                        "temp": temp,
-                        "cpu_rate": cpu_rate,
-                        "mem_rate": mem_rate,
-                        "result": result
-                    })
+                            print(f"{Fore.RED}[ERROR] {time_frame} {pm_source} 数值解析失败: {e}, Result=error{Style.RESET_ALL}")
+                        
+                        data.append({
+                            "pm_source": pm_source,
+                            "time": time,
+                            "temp": temp,
+                            "cpu_rate": cpu_rate,
+                            "mem_rate": mem_rate,
+                            "result": result
+                        })
+                        
+                    except IndexError as e:
+                        print(f"{Fore.RED}[ERROR] {time_frame} 字段索引错误: {e}, 行内容: {line}{Style.RESET_ALL}")
+                        continue
+                        
+                else:
+                    # 字段不足，记录调试信息
+                    print(f"{Fore.YELLOW}[DEBUG] {time_frame} 跳过字段不足的行: {line} (字段数: {len(parts)}){Style.RESET_ALL}")
+                    continue
+                    
         return data
 
+    # 解析15分钟数据
+    print(f"{Fore.CYAN}[DEBUG] 开始解析15分钟数据{Style.RESET_ALL}")
     data_15m = parse_pm_output(output_15m, "15分钟")
+    
+    # 解析24小时数据
+    print(f"{Fore.CYAN}[DEBUG] 开始解析24小时数据{Style.RESET_ALL}")
     data_24h = parse_pm_output(output_24h, "24小时")
 
-    # Combine 15m and 24h data by PM-Source (slot)
-    pm_sources = set([d['pm_source'] for d in data_15m] +
-                     [d['pm_source'] for d in data_24h])
-    for pm_source in pm_sources:
-        result_15m = next(
-            (d for d in data_15m if d['pm_source'] == pm_source), None)
-        result_24h = next(
-            (d for d in data_24h if d['pm_source'] == pm_source), None)
-        final_result = "normal"
-        if (result_15m and result_15m['result'] == "error") or (result_24h and result_24h['result'] == "error"):
-            final_result = "error"
-        results.append({
-            "pm_source_15m": result_15m['pm_source'] if result_15m else "-",
-            "time_15m": result_15m['time'] if result_15m else "-",
-            "temp_15m": result_15m['temp'] + "°C" if result_15m else "-",
-            "cpu_15m": result_15m['cpu_rate'] if result_15m else "-",
-            "mem_15m": result_15m['mem_rate'] if result_15m else "-",
-            "pm_source_24h": result_24h['pm_source'] if result_24h else "-",
-            "time_24h": result_24h['time'] if result_24h else "-",
-            "temp_24h": result_24h['temp'] + "°C" if result_24h else "-",
-            "cpu_24h": result_24h['cpu_rate'] if result_24h else "-",
-            "mem_24h": result_24h['mem_rate'] if result_24h else "-",
-            "result": final_result
-        })
-        print(
-            f"{Fore.YELLOW}[DEBUG] 合并 {pm_source} 数据，Result={final_result}{Style.RESET_ALL}")
+    # 合并15分钟和24小时数据
+    pm_sources = set()
+    if data_15m:
+        pm_sources.update([d['pm_source'] for d in data_15m])
+    if data_24h:
+        pm_sources.update([d['pm_source'] for d in data_24h])
+    
+    print(f"{Fore.CYAN}[DEBUG] 发现的PM源: {list(pm_sources)}{Style.RESET_ALL}")
+    
+    if pm_sources:
+        for pm_source in pm_sources:
+            # 查找对应的15分钟和24小时数据
+            result_15m = next((d for d in data_15m if d['pm_source'] == pm_source), None)
+            result_24h = next((d for d in data_24h if d['pm_source'] == pm_source), None)
+            
+            # 确定最终结果
+            final_result = "normal"
+            if (result_15m and result_15m['result'] == "error") or (result_24h and result_24h['result'] == "error"):
+                final_result = "error"
+            
+            # 构建结果字典
+            result_dict = {
+                "pm_source_15m": result_15m['pm_source'] if result_15m else "-",
+                "time_15m": result_15m['time'] if result_15m else "-",
+                "temp_15m": result_15m['temp'] + ("°C" if result_15m and "°C" not in result_15m['temp'] else "") if result_15m else "-",
+                "cpu_15m": result_15m['cpu_rate'] if result_15m else "-",
+                "mem_15m": result_15m['mem_rate'] if result_15m else "-",
+                "pm_source_24h": result_24h['pm_source'] if result_24h else "-",
+                "time_24h": result_24h['time'] if result_24h else "-",
+                "temp_24h": result_24h['temp'] + ("°C" if result_24h and "°C" not in result_24h['temp'] else "") if result_24h else "-",
+                "cpu_24h": result_24h['cpu_rate'] if result_24h else "-",
+                "mem_24h": result_24h['mem_rate'] if result_24h else "-",
+                "result": final_result
+            }
+            
+            results.append(result_dict)
+            print(f"{Fore.GREEN}[DEBUG] 合并 {pm_source} 数据，Result={final_result}{Style.RESET_ALL}")
 
+    # 如果没有解析到任何数据，返回默认错误记录
     if not results:
-        print(f"{Fore.YELLOW}[WARNING] 未解析到性能监控数据{Style.RESET_ALL}")
+        print(f"{Fore.RED}[WARNING] 未解析到任何性能监控数据{Style.RESET_ALL}")
         results.append({
             "pm_source_15m": "-",
             "time_15m": "-",
@@ -8301,6 +8989,8 @@ def parse_board_cpu_memory(output_15m, output_24h):
             "mem_24h": "-",
             "result": "error"
         })
+    
+    print(f"{Fore.CYAN}[DEBUG] 性能监控解析完成，共解析到 {len(results)} 条记录{Style.RESET_ALL}")
     return results
 
 
@@ -8788,7 +9478,7 @@ def process_optical_module_worksheet(ws, host_ips, data, connection_failures, it
         # 无接口数据的情况
         if ip not in data or "show interface" not in data[ip]:
             total_results += 1
-            ws.append([ne_type, device_name, ip] + ["无数据"] * 34 + ["error"])
+            ws.append([ne_type, device_name, ip] + ["数据异常"] * 34 + ["error"])
             for cell in ws[ws.max_row]:
                 cell.alignment = center_alignment
                 cell.border = thin_border
@@ -9169,20 +9859,9 @@ def parse_version(output):
     return version_info
 
 
-def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, timeout=15, retry_count=5, cmd_interval=1.5):
+def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, timeout=20, retry_count=5, cmd_interval=2.0):
     """
-    处理单个设备的多个命令执行
-
-    Args:
-        ip: 设备IP地址
-        user: 用户名
-        pwd: 密码
-        commands: 命令列表
-        writer: CSV写入器
-        fail_log: 失败日志文件
-        timeout: 连接超时时间(秒)
-        retry_count: 连接重试次数
-        cmd_interval: 命令之间的间隔时间(秒)
+    处理单个设备的多个命令执行 - 优化分页处理
     """
     from threading import Lock
     from datetime import datetime
@@ -9191,7 +9870,6 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
     from colorama import Fore, Style
 
     file_lock = Lock()
-    print_lock = Lock()
     channel = None
 
     try:
@@ -9199,7 +9877,7 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
             print(f"[INFO] 开始处理设备: {ip}")
         logging.info(f"开始处理设备: {ip}")
 
-        # 创建SSH通道，增加重试和超时配置
+        # 创建SSH通道
         channel = create_channel(
             ip, user, pwd, timeout=timeout, retry_count=retry_count)
 
@@ -9211,61 +9889,112 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
                 print(f"[ERROR] 设备 {ip} 连接失败")
             return None
 
-        # 设置终端不分页显示（优先尝试screen-length 0）
-        time.sleep(1)
+        # 等待连接稳定
+        time.sleep(2)
 
-        result = execute_some_command(
-            channel, "screen-length 0", timeout=2, max_retries=3, command_delay=1)
-        if "Error" in result or "ERROR: Invalid input detected at '^' marker" in result:
-            time.sleep(1)
-            execute_some_command(
-                channel, "screen-length 512", timeout=2, max_retries=3, command_delay=1)
+        # 设置终端不分页显示
+        with print_lock:
+            print(f"[DEBUG] 设置设备 {ip} 终端不分页显示...")
 
-        time.sleep(1)
+        # 首先尝试 screen-length 0
+        screen_result = execute_some_command(
+            channel, "screen-length 0", timeout=5, max_retries=3,
+            command_delay=2, device_name=ip, ip=ip
+        )
 
+        # 检查是否设置成功
+        if ("Error" in screen_result or
+            "ERROR: Invalid input detected at '^' marker" in screen_result or
+            "Unknown command" in screen_result or
+                "Unrecognized command" in screen_result):
+
+            with print_lock:
+                print(
+                    f"[DEBUG] 设备 {ip} 不支持 screen-length 0，尝试 screen-length 512")
+            time.sleep(2)
+
+            # 尝试 screen-length 512
+            screen_result = execute_some_command(
+                channel, "screen-length 512", timeout=5, max_retries=3,
+                command_delay=2, device_name=ip, ip=ip
+            )
+
+            if ("Error" in screen_result or
+                    "ERROR: Invalid input detected at '^' marker" in screen_result):
+                with print_lock:
+                    print(f"[WARNING] 设备 {ip} screen-length 设置可能失败，继续执行命令")
+            else:
+                with print_lock:
+                    print(f"[DEBUG] 设备 {ip} screen-length 512 设置成功")
+        else:
+            with print_lock:
+                print(f"[DEBUG] 设备 {ip} screen-length 0 设置成功")
+
+        time.sleep(2)  # 设置完成后等待
+
+        # 执行命令列表
         for i, cmd in enumerate(commands):
             with print_lock:
                 print(f"[DEBUG] 执行命令 {cmd} 于设备 {ip}")
             logging.info(f"设备 {ip} - 执行命令: {cmd}")
 
-            # 如果不是第一条命令，添加命令间延迟
+            # 命令间延迟
             if i > 0:
-                with print_lock:
-                    print(f"[INFO] 等待 {cmd_interval} 秒后执行下一命令...")
                 time.sleep(cmd_interval)
 
-            # 在执行命令前记录PC时间
+            # 记录PC时间
             pc_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            # 执行命令
+            # 执行命令 - 使用更长的超时时间处理分页
             output = execute_some_command(
-                channel, cmd, timeout=10, max_retries=3, command_delay=1.5, device_name=ip, ip=ip)
-
-            # 检查输出是否包含错误
-            if "ERROR" in output or "ERROR: Invalid input detected at '^' marker" in output:
-                with print_lock:
-                    print(f"[WARNING] 命令 {cmd} 于设备 {ip} 执行失败: {output[:500]}...")
-                logging.warning(f"命令 {cmd} 于设备 {ip} 执行失败")
-                time.sleep(3)
+                channel, cmd, timeout=30, max_retries=3,
+                command_delay=2, device_name=ip, ip=ip
+            )
 
             # 清理输出内容
-            clean_output = "\n".join([
-                line.strip() for line in output.split('\n')
-                if line.strip() and
-                line.strip() != cmd and
-                not line.strip().startswith(cmd)
-            ])
+            lines = output.split('\n')
+            clean_lines = []
+            skip_next = False
 
-            # 将PC时间附加到输出中
+            for j, line in enumerate(lines):
+                line_stripped = line.strip()
+
+                # 跳过空行和分页提示
+                if not line_stripped or '----MORE----' in line_stripped:
+                    continue
+
+                # 跳过纯命令回显行
+                if line_stripped == cmd.strip():
+                    skip_next = True
+                    continue
+
+                # 如果上一行是命令，当前行是错误标记，跳过
+                if skip_next and ("^" in line_stripped or "ERROR:" in line_stripped):
+                    skip_next = False
+                    continue
+
+                skip_next = False
+
+                # 跳过短提示符
+                if len(line_stripped) < 10 and (line_stripped.endswith('>') or
+                                                line_stripped.endswith('#') or
+                                                line_stripped.endswith('$')):
+                    continue
+
+                clean_lines.append(line)
+
+            clean_output = '\n'.join(clean_lines)
+
+            # 添加PC时间
             clean_output_with_time = f"PC_TIME: {pc_time}\n{clean_output}"
 
-            # 输出前800个字符用于调试
+            # 输出预览
             output_preview = clean_output[:800] + \
                 "..." if len(clean_output) > 800 else clean_output
             with print_lock:
                 print(f"[DEBUG] 设备 {ip} 命令 {cmd} 输出(预览): {output_preview}")
 
-            # 安全写入输出结果
+            # 写入结果
             with file_lock:
                 try:
                     writer.writerow([ip, cmd, clean_output_with_time])
@@ -9274,65 +10003,73 @@ def process_multiple_cmds_device(ip, user, pwd, commands, writer, fail_log, time
                     with print_lock:
                         print(f"[ERROR] 写入结果到CSV时出错: {write_err}")
 
-    except ValueError as auth_error:
+    except Exception as e:
         with print_lock:
-            print(f"[WARNING] 设备 {ip} 认证失败: {auth_error}")
-        logging.warning(f"设备 {ip} 认证失败: {auth_error}")
+            print(f"[ERROR] 设备 {ip} 处理失败: {e}")
+        logging.error(f"设备 {ip} 处理失败: {e}")
         with file_lock:
             fail_log.write(
-                f"{ip},用户名或密码错误,{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-    except Exception as cmd_error:
-        with print_lock:
-            print(f"[WARNING] 设备 {ip} 执行命令失败: {cmd_error}")
-        logging.error(f"设备 {ip} 执行命令失败: {cmd_error}")
-        with file_lock:
-            fail_log.write(
-                f"{ip},连接失败,{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f"{ip},处理失败,{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     finally:
         if channel:
             try:
-                time.sleep(2)
+                # 恢复终端设置
+                time.sleep(1)
                 execute_some_command(
-                    channel, "screen-length 25", timeout=2, max_retries=3, command_delay=1)
-            except Exception as restore_error:
-                with print_lock:
-                    print(f"[WARNING] 恢复终端设置失败: {restore_error}")
-                logging.warning(f"设备 {ip} 恢复终端设置失败: {restore_error}")
-            finally:
-                try:
-                    time.sleep(2)
-                    channel.close()
-                except Exception as close_error:
-                    with print_lock:
-                        print(f"[WARNING] 关闭 {ip} 连接时出错: {close_error}")
-                    logging.warning(f"关闭 {ip} 连接时出错: {close_error}")
+                    channel, "screen-length 25", timeout=3, max_retries=1,
+                    command_delay=1, device_name=ip, ip=ip
+                )
+            except:
+                pass
+
+            try:
+                channel.close()
+            except:
+                pass
 
         logging.info(f"设备 {ip} 处理完成")
         with print_lock:
             print(f"[INFO] 设备 {ip} 指令处理完成")
+
         return ip
 
 
 def parse_uptime(output):
+    """
+    Parse 'show device' output to extract ne_type, device_name, uptime, and result.
+    Returns: (ne_type, device_name, uptime, result)
+    """
     print(f"{Fore.CYAN}[DEBUG] 开始解析 'show device' 输出{Style.RESET_ALL}")
     lines = output.split('\n')
-    device_name = None
-    ne_type = None
-    uptime = None
+    device_name = None  # 改回原版的初始化方式
+    ne_type = None      # 改回原版的初始化方式
+    uptime = None       # 改回原版的初始化方式
     found_stn = False
     found_uptime = False
 
     for line in lines:
         line = line.strip()
-        # 提取设备名称
+
+        # 提取设备名称 - 使用原版的简单有效逻辑
         if not device_name and line.startswith('<') and line.endswith('>'):
             device_name = line[1:-1]
             print(
                 f"{Fore.YELLOW}[DEBUG] 提取设备名称: {device_name}{Style.RESET_ALL}")
 
-        # 提取网元类型
+        # 提取网元类型 - 保持新版的增强逻辑
+        # 模式1: OPTEL MssEdge 格式
+        elif line.startswith("OPTEL MssEdge") and not ne_type:
+            ne_type_match = re.match(r'OPTEL (MssEdge [^,]+),', line)
+            if ne_type_match:
+                ne_type = ne_type_match.group(1).strip()
+                print(
+                    f"{Fore.YELLOW}[DEBUG] 提取网元类型 (OPTEL格式): {ne_type} (原始: {line}){Style.RESET_ALL}")
+            else:
+                print(
+                    f"{Fore.YELLOW}[WARNING] 网元类型匹配失败: {line}{Style.RESET_ALL}")
+
+        # 模式2: stn-standard-reserved 标记格式 - 使用原版逻辑
         elif "stn-standard-reserved" in line:
             found_stn = True
         elif found_stn and not ne_type:
@@ -9343,7 +10080,7 @@ def parse_uptime(output):
                 f"{Fore.YELLOW}[DEBUG] 提取网元类型: {ne_type} (原始: {ne_type_full}){Style.RESET_ALL}")
             found_stn = False  # 重置标志位
 
-        # 提取运行时间
+        # 提取运行时间 - 使用原版逻辑但增加状态判断
         elif line == "uptime:":
             found_uptime = True
         elif found_uptime and not uptime:
@@ -9359,15 +10096,43 @@ def parse_uptime(output):
         if device_name and ne_type and uptime:
             break
 
-    # 处理结果
-    result = "normal" if uptime else "error"
+    # 处理结果 - 增强的状态判断逻辑
+    if uptime:
+        try:
+            # 尝试提取天数来判断状态
+            if '天' in uptime:
+                days = int(uptime.split('天')[0])
+                result = "normal" if days > 1 else "error"
+            elif 'day' in uptime:  # 处理原始英文格式
+                # 从原始输出中提取天数
+                uptime_raw = uptime.replace('天，', ' day, ').replace(
+                    '小时，', ' hours, ').replace('分钟', ' minutes')
+                days = int(uptime_raw.split(' day')[0])
+                result = "normal" if days > 1 else "error"
+            else:
+                # 如果没有天数信息但有uptime，也算normal
+                result = "normal"
+        except (ValueError, IndexError) as e:
+            print(f"{Fore.YELLOW}[WARNING] 解析天数失败: {e}{Style.RESET_ALL}")
+            # 如果解析失败但有uptime信息，仍然算normal
+            result = "normal"
+    else:
+        result = "error"
+
+    # 处理未解析到的信息 - 使用原版的默认值处理
     if not device_name:
         print(f"{Fore.YELLOW}[WARNING] 未解析到设备名称{Style.RESET_ALL}")
         device_name = "-"
     if not ne_type:
         print(f"{Fore.YELLOW}[WARNING] 未解析到网元类型{Style.RESET_ALL}")
         ne_type = "-"
+    if not uptime:
+        uptime = "-"
+
     print(f"{Fore.YELLOW}[DEBUG] 确定Result状态: {result}{Style.RESET_ALL}")
+    print(
+        f"{Fore.YELLOW}[DEBUG] 解析结果: ne_type={ne_type}, device_name={device_name}, uptime={uptime}, result={result}{Style.RESET_ALL}")
+
     return ne_type, device_name, uptime, result
 
 
@@ -9537,7 +10302,6 @@ def parse_real_version(output):
 
 def parse_main_control_status(output):
     """Parse 'show device' output for main control board status (CPU and memory usage)."""
-    from colorama import Fore, Style
     print(
         f"{Fore.CYAN}[DEBUG] 开始解析 'show device' 输出以获取主控盘运行状态{Style.RESET_ALL}")
     lines = output.split('\n')
@@ -9557,12 +10321,30 @@ def parse_main_control_status(output):
             device_name = line[1:-1]
             print(
                 f"{Fore.YELLOW}[DEBUG] 提取设备名称: {device_name}{Style.RESET_ALL}")
-        if "stn-standard-reserved" in line:
+            # Extract NE type from device name
+            if 'MssEdge20' in device_name:
+                ne_type = "MssEdge 20 A1"
+            elif 'MssEdge25-S10-3' in device_name:
+                ne_type = "MssEdge 25 S10-3"
+            elif 'MssEdge25-S10' in device_name:
+                ne_type = "MssEdge 25 S10"
+            print(
+                f"{Fore.YELLOW}[DEBUG] 从设备名称提取网元类型: {ne_type or '-'}{Style.RESET_ALL}")
+
+        if "stn-standard-reserved" in line and not ne_type:
             if i + 1 < len(lines):
                 ne_type_full = lines[i + 1].strip()
                 ne_type = ne_type_full.split(',')[0].strip()
+                # Standardize NE type
+                if 'MssEdge20' in ne_type:
+                    ne_type = "MssEdge 20 A1"
+                elif 'MssEdge25-S10-3' in ne_type:
+                    ne_type = "MssEdge 25 S10-3"
+                elif 'MssEdge25-S10' in ne_type:
+                    ne_type = "MssEdge 25 S10"
                 print(
-                    f"{Fore.YELLOW}[DEBUG] 提取网元类型: {ne_type}{Style.RESET_ALL}")
+                    f"{Fore.YELLOW}[DEBUG] 从下一行提取网元类型: {ne_type or '-'}{Style.RESET_ALL}")
+
         if line == "cpu-usage:":
             in_cpu_section = True
             continue
@@ -9577,31 +10359,26 @@ def parse_main_control_status(output):
                     f"{Fore.YELLOW}[DEBUG] 提取CPU使用率: {cpu_usage}{Style.RESET_ALL}")
             if "CPU utilization for five seconds:" in line:
                 parts = line.split(':')
-                cpu_5min = parts[1].strip().split('%')[0].strip() + '%'
-                cpu_15min = parts[3].strip()
-                print(
-                    f"{Fore.YELLOW}[DEBUG] 提取五分钟CPU: {cpu_5min}, 十五分钟CPU: {cpu_15min}{Style.RESET_ALL}")
+                if len(parts) >= 4:
+                    cpu_5min = parts[1].strip().split('%')[0].strip() + '%'
+                    cpu_15min = parts[3].strip()
+                    print(
+                        f"{Fore.YELLOW}[DEBUG] 提取五分钟CPU: {cpu_5min}, 十五分钟CPU: {cpu_15min}{Style.RESET_ALL}")
         if in_memory_section:
             if "Memory Using Percentage :" in line:
                 memory_usage = line.split(':')[1].strip()
                 print(
                     f"{Fore.YELLOW}[DEBUG] 提取内存使用率: {memory_usage}{Style.RESET_ALL}")
 
-    # Determine the result, handling the case where cpu_15min is None
-    result = "error"  # Default to error if data is missing or cannot be parsed
+    # Determine the result
+    result = "error"
     if cpu_15min is not None:
         try:
             cpu_15min_val = float(cpu_15min.rstrip('%'))
-            if cpu_15min_val >= 60:
-                result = "error"
-                print(
-                    f"{Fore.YELLOW}[DEBUG] 十五分钟CPU使用率 ({cpu_15min_val}%) >= 60%，Result: error{Style.RESET_ALL}")
-            else:
-                result = "normal"
-                print(
-                    f"{Fore.YELLOW}[DEBUG] 十五分钟CPU使用率 ({cpu_15min_val}%) < 60%，Result: normal{Style.RESET_ALL}")
+            result = "error" if cpu_15min_val >= 60 else "normal"
+            print(
+                f"{Fore.YELLOW}[DEBUG] 十五分钟CPU使用率 ({cpu_15min_val}%) {'>=' if cpu_15min_val >= 60 else '<'} 60%，Result: {result}{Style.RESET_ALL}")
         except ValueError:
-            result = "error"
             print(
                 f"{Fore.YELLOW}[WARNING] CPU使用率解析失败，Result: error{Style.RESET_ALL}")
     else:
@@ -9609,8 +10386,7 @@ def parse_main_control_status(output):
             f"{Fore.YELLOW}[WARNING] 未找到CPU利用率数据，Result: error{Style.RESET_ALL}")
 
     print(f"{Fore.YELLOW}[DEBUG] 确定Result状态: {result}{Style.RESET_ALL}")
-    return (ne_type or "-", device_name or "-", cpu_usage or "-", cpu_5min or "-",
-            cpu_15min or "-", memory_usage or "-", result)
+    return (ne_type or "-", device_name or "-", cpu_usage or "-", cpu_5min or "-", cpu_15min or "-", memory_usage or "-", result)
 
 
 def parse_cpu_defend_stats(output):
@@ -9696,16 +10472,15 @@ def create_progress_bar(percentage):
 
 
 def create_device_panel_layout(ws, devices_data):
-    """创建设备面板视图的表格布局 - 每个设备占用6行，设备间增加间隔行"""
+    """创建设备面板视图的表格布局 - 按设备型号分类版本"""
     from openpyxl.styles import PatternFill, Alignment, Border, Side
 
-    # 定义样式 - 将绿色改为深绿色
+    # 定义样式
     yellow_fill = PatternFill(start_color="FFFFFF00",
                               end_color="FFFFFF00", fill_type="solid")
     dark_green_fill = PatternFill(
-        start_color="FF00B050", end_color="FF00B050", fill_type="solid")  # 深绿色
+        start_color="FF00B050", end_color="FF00B050", fill_type="solid")
     center_alignment = Alignment(horizontal="center", vertical="center")
-    # 添加支持换行的对齐方式
     center_alignment_wrap = Alignment(
         horizontal="center", vertical="center", wrap_text=True)
     thin_border = Border(
@@ -9713,16 +10488,104 @@ def create_device_panel_layout(ws, devices_data):
         top=Side(style='thin'), bottom=Side(style='thin')
     )
 
-    # 过滤掉None值并按设备类型分类
+    # 过滤掉None值
     valid_devices = [
         d for d in devices_data if d is not None and isinstance(d, dict)]
 
-    a1_devices = [d for d in valid_devices if 'A1' in d.get('device_name', '')]
-    a2_devices = [d for d in valid_devices if 'A2' in d.get('device_name', '')]
-    a3_devices = [d for d in valid_devices if 'A3' in d.get('device_name', '')]
+    # 如果没有有效设备，创建一行提示信息
+    if not valid_devices:
+        print("[WARNING] 没有找到有效的设备数据")
+        # 创建表头
+        headers = ['面板', '', '', '', '备注', '', '面板', '',
+                   '', '', '备注', '', '面板', '', '', '', '备注']
+        ws.append(headers)
 
-    # 计算需要的总行数 (每个设备类型最多的设备数量 * (6行 + 1间隔行) + 表头1行)
-    max_devices = max(len(a1_devices), len(a2_devices), len(a3_devices))
+        # 应用表头样式
+        for col in range(1, 18):
+            cell = ws.cell(row=1, column=col)
+            cell.fill = yellow_fill
+            cell.alignment = center_alignment
+            cell.border = thin_border
+
+        # 合并表头单元格
+        ws.merge_cells('A1:D1')  # MssEdge 25 S10设备面板
+        ws.merge_cells('G1:J1')  # MssEdge 20 A1设备面板
+        ws.merge_cells('M1:P1')  # MssEdge 25 S10-3设备面板
+
+        # 添加提示信息行
+        ws.append(['无设备数据'] + [''] * 16)
+        return
+
+    # 改进的设备分类逻辑 - 基于设备型号进行分类
+    mssedge_25_s10_devices = []      # 左边列
+    mssedge_20_a1_devices = []       # 中间列
+    mssedge_25_s10_3_devices = []    # 右边列
+    other_devices = []
+
+    for device in valid_devices:
+        device_model = device.get('device_model', '').upper()
+        device_name = device.get('device_name', '').upper()
+
+        # 检查设备型号或名称中的关键字
+        model_and_name = f"{device_model} {device_name}"
+
+        print(f"[DEBUG] 设备分类检查: 型号='{device_model}', 名称='{device_name}'")
+
+        # 按照设备型号进行分类
+        if 'MSSEDGE 25 S10-3' in model_and_name or 'S10-3' in model_and_name:
+            # MssEdge 25 S10-3 (右边列)
+            mssedge_25_s10_3_devices.append(device)
+            print(f"[DEBUG] 设备归类到S10-3: {device.get('device_ip')}")
+        elif 'MSSEDGE 25 S10' in model_and_name or ('S10' in model_and_name and 'S10-3' not in model_and_name):
+            # MssEdge 25 S10 (左边列)
+            mssedge_25_s10_devices.append(device)
+            print(f"[DEBUG] 设备归类到S10: {device.get('device_ip')}")
+        elif 'MSSEDGE 20 A1' in model_and_name or 'A1' in model_and_name:
+            # MssEdge 20 A1 (中间列)
+            mssedge_20_a1_devices.append(device)
+            print(f"[DEBUG] 设备归类到A1: {device.get('device_ip')}")
+        else:
+            # 无法识别的设备类型，根据槽位数量进行推测
+            slot_count = len(device.get('slots', {}))
+            print(f"[DEBUG] 未识别设备类型，槽位数量: {slot_count}")
+
+            if slot_count <= 4:
+                # 槽位较少，可能是A1设备
+                mssedge_20_a1_devices.append(device)
+                print(f"[DEBUG] 根据槽位数推测为A1设备: {device.get('device_ip')}")
+            elif slot_count > 8:
+                # 槽位较多，可能是S10设备
+                mssedge_25_s10_devices.append(device)
+                print(f"[DEBUG] 根据槽位数推测为S10设备: {device.get('device_ip')}")
+            else:
+                # 中等槽位数，可能是S10-3设备
+                mssedge_25_s10_3_devices.append(device)
+                print(f"[DEBUG] 根据槽位数推测为S10-3设备: {device.get('device_ip')}")
+
+    # 如果所有设备都无法分类，将它们都放到S10类别（默认布局）
+    if not mssedge_25_s10_devices and not mssedge_20_a1_devices and not mssedge_25_s10_3_devices:
+        print("[WARNING] 无法识别设备类型，使用默认S10布局")
+        mssedge_25_s10_devices = valid_devices
+
+    # 输出调试信息
+    print(
+        f"[DEBUG] 设备分类结果: S10={len(mssedge_25_s10_devices)}, A1={len(mssedge_20_a1_devices)}, S10-3={len(mssedge_25_s10_3_devices)}")
+    for i, device in enumerate(valid_devices[:3]):  # 只显示前3个设备的信息
+        print(f"[DEBUG] 设备{i+1}: 名称={device.get('device_name', 'N/A')}, "
+              f"类型={device.get('device_type', 'N/A')}, "
+              f"IP={device.get('device_ip', 'N/A')}, "
+              f"型号={device.get('device_model', 'N/A')}, "
+              f"槽位数={len(device.get('slots', {}))}")
+
+    # 计算需要的总行数
+    max_devices = max(len(mssedge_25_s10_devices), len(
+        mssedge_20_a1_devices), len(mssedge_25_s10_3_devices))
+
+    if max_devices == 0:
+        print("[WARNING] 没有设备被正确分类")
+        max_devices = 1  # 至少显示一行
+
+    print(f"[DEBUG] 最大设备数: {max_devices}")
 
     # 创建表头
     headers = ['面板', '', '', '', '备注', '', '面板', '',
@@ -9737,17 +10600,16 @@ def create_device_panel_layout(ws, devices_data):
         cell.border = thin_border
 
     # 合并表头单元格
-    ws.merge_cells('A1:D1')  # A2设备面板
-    ws.merge_cells('G1:J1')  # A1设备面板
-    ws.merge_cells('M1:P1')  # A3设备面板
+    ws.merge_cells('A1:D1')  # MssEdge 25 S10设备面板
+    ws.merge_cells('G1:J1')  # MssEdge 20 A1设备面板
+    ws.merge_cells('M1:P1')  # MssEdge 25 S10-3设备面板
 
-    # 为每个设备创建6行布局 + 1行间隔
+    # 为每个设备创建7行布局（增加一行用于设备名称）
     current_row = 2
 
-    # 处理所有设备，每个设备占用6行 + 间隔行
     for device_index in range(max_devices):
-        # 创建6行设备面板行
-        for i in range(6):
+        # 创建7行设备面板行（原来6行+1行设备名称）
+        for i in range(7):
             ws.append([''] * 17)
             # 应用边框和对齐
             for col in range(1, 18):
@@ -9755,27 +10617,283 @@ def create_device_panel_layout(ws, devices_data):
                 cell.border = thin_border
                 cell.alignment = center_alignment
 
-        # 填充A2设备数据
-        if device_index < len(a2_devices):
-            fill_a2_device_panel(
-                ws, a2_devices[device_index], current_row, dark_green_fill)
+        print(f"[DEBUG] 创建设备面板行 {device_index + 1}, 起始行: {current_row}")
 
-        # 填充A1设备数据
-        if device_index < len(a1_devices):
+        # 填充MssEdge 25 S10设备数据（左边列）
+        if device_index < len(mssedge_25_s10_devices):
+            print(
+                f"[DEBUG] 填充S10设备: {mssedge_25_s10_devices[device_index].get('device_name', 'N/A')}")
+            fill_s10_device_panel(
+                ws, mssedge_25_s10_devices[device_index], current_row, dark_green_fill)
+
+        # 填充MssEdge 20 A1设备数据（中间列）
+        if device_index < len(mssedge_20_a1_devices):
+            print(
+                f"[DEBUG] 填充A1设备: {mssedge_20_a1_devices[device_index].get('device_name', 'N/A')}")
             fill_a1_device_panel(
-                ws, a1_devices[device_index], current_row, dark_green_fill)
+                ws, mssedge_20_a1_devices[device_index], current_row, dark_green_fill)
 
-        # 填充A3设备数据
-        if device_index < len(a3_devices):
-            fill_a3_device_panel(
-                ws, a3_devices[device_index], current_row, dark_green_fill)
+        # 填充MssEdge 25 S10-3设备数据（右边列）
+        if device_index < len(mssedge_25_s10_3_devices):
+            print(
+                f"[DEBUG] 填充S10-3设备: {mssedge_25_s10_3_devices[device_index].get('device_name', 'N/A')}")
+            fill_s10_3_device_panel(
+                ws, mssedge_25_s10_3_devices[device_index], current_row, dark_green_fill)
 
-        current_row += 6  # 移动到下一个设备区域
+        current_row += 7  # 移动到下一个设备区域（改为7行）
 
         # 在设备间增加间隔行（除了最后一个设备）
         if device_index < max_devices - 1:
             ws.append([''] * 17)
             current_row += 1
+
+    print(f"[DEBUG] 设备面板布局创建完成，总共创建了 {current_row - 1} 行")
+
+
+def fill_s10_device_panel(ws, device_data, start_row, green_fill):
+    """填充MssEdge 25 S10设备面板数据 - 7行布局，当有任何槽位板卡时整个框都填充颜色"""
+    from openpyxl.styles import Alignment
+
+    slots = device_data.get('slots', {})
+
+    # 检查是否有任何槽位板卡（除了电源槽位12、13）
+    has_any_card = any(slots.get(slot_num, {}).get('card_name', '')
+                       for slot_num in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+
+    # A列 - 槽位11 (6行合并)
+    ws.merge_cells(f'A{start_row}:A{start_row + 5}')
+
+    # 填充槽位11内容 - 修复风扇显示格式，添加换行支持
+    slot_11_info = slots.get(11, {})
+    slot_11_name = slot_11_info.get('card_name', '')
+    if slot_11_name and 'FAN' in slot_11_name.upper():
+        # 风扇槽位显示为"FAN\n11"格式
+        cell = ws.cell(row=start_row, column=1)
+        cell.value = f"FAN\n11"
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+    else:
+        cell = ws.cell(row=start_row, column=1)
+        cell.value = slot_11_name if slot_11_name else ""
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+
+    # 如果有任何板卡，则整个A列都填充颜色
+    if has_any_card:
+        for row in range(start_row, start_row + 6):
+            ws.cell(row=row, column=1).fill = green_fill
+
+    # B列布局 - 分为3个区域，每个区域2行 - 修复电源槽位大小
+    ws.merge_cells(f'B{start_row}:B{start_row + 1}')      # 槽位13 (电源) - 2行高度
+    ws.merge_cells(f'B{start_row + 2}:B{start_row + 3}')  # 空白区域 - 2行高度
+    ws.merge_cells(f'B{start_row + 4}:B{start_row + 5}')  # 槽位12 (电源) - 2行高度
+
+    # 如果有任何板卡，电源槽位也填充颜色
+    if has_any_card:
+        # 槽位13电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row, column=2)
+        cell.value = "PWR\n13"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+
+        # 空白区域也填充颜色
+        ws.cell(row=start_row + 2, column=2).fill = green_fill
+
+        # 槽位12电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row + 4, column=2)
+        cell.value = "PWR\n12"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+
+    # C和D列的槽位布局
+    slot_layout = [
+        # (slot_num, row_offset, col_offset, merge_cols)
+        (7, 0, 3, False),   # C行1 - 槽位7
+        (8, 0, 4, False),   # D行1 - 槽位8
+        (5, 1, 3, False),   # C行2 - 槽位5
+        (6, 1, 4, False),   # D行2 - 槽位6
+        (10, 2, 3, True),   # C-D行3 - 槽位10 (主备)
+        (9, 3, 3, True),    # C-D行4 - 槽位9 (主备)
+        (3, 4, 3, False),   # C行5 - 槽位3
+        (4, 4, 4, False),   # D行5 - 槽位4
+        (1, 5, 3, False),   # C行6 - 槽位1
+        (2, 5, 4, False),   # D行6 - 槽位2
+    ]
+
+    for slot_num, row_offset, col, merge_cols in slot_layout:
+        slot_info = slots.get(slot_num, {})
+        card_name = slot_info.get('card_name', '')
+        status = slot_info.get('status', '')
+
+        if merge_cols and col == 3:  # 主备槽位需要合并单元格
+            ws.merge_cells(
+                f'{chr(ord("A") + col - 1)}{start_row + row_offset}:{chr(ord("A") + col)}{start_row + row_offset}')
+
+        # 如果有任何板卡，所有槽位都填充颜色
+        if has_any_card:
+            ws.cell(row=start_row + row_offset, column=col).fill = green_fill
+            if merge_cols and col == 3:
+                ws.cell(row=start_row + row_offset,
+                        column=col + 1).fill = green_fill
+
+        # 设置内容
+        if card_name:
+            if slot_num in [9, 10]:  # 主备槽位
+                status_char = '主' if 'Master' in status else '备' if 'Backup' in status else ''
+                content = f"{card_name}        {status_char}·{slot_num}" if status_char else f"{card_name}·{slot_num}"
+            else:
+                content = f"{card_name}     ·{slot_num}"
+
+            cell = ws.cell(row=start_row + row_offset, column=col)
+            cell.value = content
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
+
+    # E列 - 备注信息（增加一行设备名称）
+    ws.cell(row=start_row, column=5).value = "OPTEL"
+    ws.cell(row=start_row + 1, column=5).value = device_data.get('device_ip', '')
+    ws.cell(row=start_row + 2, column=5).value = device_data.get('device_model', '')
+    ws.cell(row=start_row + 3,
+            column=5).value = device_data.get('device_name', '')  # 新增设备名称行
+
+
+def fill_a1_device_panel(ws, device_data, start_row, green_fill):
+    """填充MssEdge 20 A1设备面板数据 - 简化4槽位布局，只在有设备槽位时填充颜色"""
+    from openpyxl.styles import Alignment
+
+    slots = device_data.get('slots', {})
+
+    # G-J列，第一行显示4个槽位，内容为固定格式"S10_04"
+    for slot_num in range(1, 5):  # 槽位1-4
+        col = 6 + slot_num  # G=7, H=8, I=9, J=10
+        slot_info = slots.get(slot_num, {})
+
+        # 只有当槽位有设备时才填充内容和颜色
+        if slot_info.get('card_name'):
+            # A1设备的槽位内容固定为"S10_04"
+            content = "S10_04"
+            cell = ws.cell(row=start_row, column=col)
+            cell.value = content
+            cell.fill = green_fill
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
+
+    # K列 - 备注信息（增加一行设备名称）
+    ws.cell(row=start_row, column=11).value = "OPTEL"
+    ws.cell(row=start_row + 1, column=11).value = device_data.get('device_ip', '')
+    ws.cell(row=start_row + 2, column=11).value = device_data.get('device_model', '')
+    ws.cell(row=start_row + 3,
+            column=11).value = device_data.get('device_name', '')  # 新增设备名称行
+
+
+def fill_s10_3_device_panel(ws, device_data, start_row, green_fill):
+    """填充MssEdge 25 S10-3设备面板数据 - 与S10设备布局相同，使用M-Q列，当有任何槽位板卡时整个框都填充颜色"""
+    from openpyxl.styles import Alignment
+
+    slots = device_data.get('slots', {})
+
+    # 检查是否有任何槽位板卡（除了电源槽位12、13）
+    has_any_card = any(slots.get(slot_num, {}).get('card_name', '')
+                       for slot_num in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+
+    # M列 - 槽位11 (6行合并)
+    ws.merge_cells(f'M{start_row}:M{start_row + 5}')
+
+    # 填充槽位11内容 - 修复风扇显示格式，添加换行支持
+    slot_11_info = slots.get(11, {})
+    slot_11_name = slot_11_info.get('card_name', '')
+    if slot_11_name and 'FAN' in slot_11_name.upper():
+        # 风扇槽位显示为"FAN\n11"格式
+        cell = ws.cell(row=start_row, column=13)
+        cell.value = f"FAN\n11"
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+    else:
+        cell = ws.cell(row=start_row, column=13)
+        cell.value = slot_11_name if slot_11_name else ""
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+
+    # 如果有任何板卡，则整个M列都填充颜色
+    if has_any_card:
+        for row in range(start_row, start_row + 6):
+            ws.cell(row=row, column=13).fill = green_fill
+
+    # N列布局 - 修复电源槽位大小
+    ws.merge_cells(f'N{start_row}:N{start_row + 1}')      # 槽位13 (电源) - 2行高度
+    ws.merge_cells(f'N{start_row + 2}:N{start_row + 3}')  # 空白区域 - 2行高度
+    ws.merge_cells(f'N{start_row + 4}:N{start_row + 5}')  # 槽位12 (电源) - 2行高度
+
+    # 如果有任何板卡，电源槽位也填充颜色
+    if has_any_card:
+        # 槽位13电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row, column=14)
+        cell.value = "PWR\n13"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+
+        # 空白区域也填充颜色
+        ws.cell(row=start_row + 2, column=14).fill = green_fill
+
+        # 槽位12电源 - 修复显示格式和对齐，添加换行支持
+        cell = ws.cell(row=start_row + 4, column=14)
+        cell.value = "PWR\n12"
+        cell.fill = green_fill
+        cell.alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+
+    # O和P列的槽位布局 (类似C和D列，但使用列15和16)
+    slot_layout = [
+        (7, 0, 15, False),   # O行1 - 槽位7
+        (8, 0, 16, False),   # P行1 - 槽位8
+        (5, 1, 15, False),   # O行2 - 槽位5
+        (6, 1, 16, False),   # P行2 - 槽位6
+        (10, 2, 15, True),   # O-P行3 - 槽位10 (主备)
+        (9, 3, 15, True),    # O-P行4 - 槽位9 (主备)
+        (3, 4, 15, False),   # O行5 - 槽位3
+        (4, 4, 16, False),   # P行5 - 槽位4
+        (1, 5, 15, False),   # O行6 - 槽位1
+        (2, 5, 16, False),   # P行6 - 槽位2
+    ]
+
+    for slot_num, row_offset, col, merge_cols in slot_layout:
+        slot_info = slots.get(slot_num, {})
+        card_name = slot_info.get('card_name', '')
+        status = slot_info.get('status', '')
+
+        if merge_cols and col == 15:  # 主备槽位需要合并单元格
+            ws.merge_cells(
+                f'{chr(ord("A") + col - 1)}{start_row + row_offset}:{chr(ord("A") + col)}{start_row + row_offset}')
+
+        # 如果有任何板卡，所有槽位都填充颜色
+        if has_any_card:
+            ws.cell(row=start_row + row_offset, column=col).fill = green_fill
+            if merge_cols and col == 15:
+                ws.cell(row=start_row + row_offset,
+                        column=col + 1).fill = green_fill
+
+        # 设置内容
+        if card_name:
+            if slot_num in [9, 10]:  # 主备槽位
+                status_char = '主' if 'Master' in status else '备' if 'Backup' in status else ''
+                content = f"{card_name}        {status_char}·{slot_num}" if status_char else f"{card_name}·{slot_num}"
+            else:
+                content = f"{card_name}     ·{slot_num}"
+
+            cell = ws.cell(row=start_row + row_offset, column=col)
+            cell.value = content
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
+
+    # Q列 - 备注信息（增加一行设备名称）
+    ws.cell(row=start_row, column=17).value = "OPTEL"
+    ws.cell(row=start_row + 1, column=17).value = device_data.get('device_ip', '')
+    ws.cell(row=start_row + 2, column=17).value = device_data.get('device_model', '')
+    ws.cell(row=start_row + 3,
+            column=17).value = device_data.get('device_name', '')  # 新增设备名称行
 
 
 def fill_a2_device_panel(ws, device_data, start_row, green_fill):
@@ -9883,32 +11001,6 @@ def fill_a2_device_panel(ws, device_data, start_row, green_fill):
     ws.cell(row=start_row, column=5).value = device_data.get('device_name', '')
     ws.cell(row=start_row + 1, column=5).value = device_data.get('device_ip', '')
     ws.cell(row=start_row + 2, column=5).value = device_data.get('device_model', '')
-
-
-def fill_a1_device_panel(ws, device_data, start_row, green_fill):
-    """填充A1设备面板数据 - 简化4槽位布局，只在有设备槽位时填充颜色"""
-
-    slots = device_data.get('slots', {})
-
-    # G-J列，第一行显示4个槽位，内容为固定格式"S10_04"
-    for slot_num in range(1, 5):  # 槽位1-4
-        col = 6 + slot_num  # G=7, H=8, I=9, J=10
-        slot_info = slots.get(slot_num, {})
-
-        # 只有当槽位有设备时才填充内容和颜色
-        if slot_info.get('card_name'):
-            # A1设备的槽位内容固定为"S10_04"
-            content = "S10_04"
-            cell = ws.cell(row=start_row, column=col)
-            cell.value = content
-            cell.fill = green_fill
-            cell.alignment = Alignment(
-                horizontal="center", vertical="center", wrap_text=True)
-
-    # K列 - 备注信息
-    ws.cell(row=start_row, column=11).value = device_data.get('device_name', '')
-    ws.cell(row=start_row + 1, column=11).value = device_data.get('device_ip', '')
-    ws.cell(row=start_row + 2, column=11).value = device_data.get('device_model', '')
 
 
 def fill_a3_device_panel(ws, device_data, start_row, green_fill):
@@ -10057,7 +11149,7 @@ def apply_autofit_to_all_sheets(wb):
 
 
 def parse_device_panel(device_output, ne_type, ne_name, ne_ip):
-    """解析设备面板信息，提取槽位和板卡信息"""
+    """解析设备面板信息，提取槽位和板卡信息 - 增强版本"""
     import re
 
     # 确保参数不为None
@@ -10077,57 +11169,104 @@ def parse_device_panel(device_output, ne_type, ne_name, ne_ip):
         'slots': {}
     }
 
+    print(f"[DEBUG] 解析设备面板: {ne_name} ({ne_ip})")
+
     # 如果没有输出数据，返回基本信息
     if not device_output or not isinstance(device_output, str):
         result_data['device_model'] = "-"
+        print(f"[DEBUG] 设备 {ne_ip} 没有输出数据")
         return result_data
 
     # 将输出按行分割
     lines = device_output.splitlines()
+    print(f"[DEBUG] 设备 {ne_ip} 输出行数: {len(lines)}")
 
-    # 提取设备型号
+    # 提取设备型号 - 改进的匹配逻辑
     device_model = "-"
     for line in lines:
-        if "OPTEL MssEdge" in line and "Copyright" in line:
+        line_stripped = line.strip()
+        # 尝试多种模式匹配设备型号
+        if "OPTEL MssEdge" in line:
             parts = line.split(',')
             if len(parts) > 0:
                 device_model = parts[0].strip()
                 break
+        elif "model" in line.lower() or "type" in line.lower():
+            # 尝试其他可能的型号信息
+            if ":" in line:
+                device_model = line.split(":")[-1].strip()
+                break
 
     result_data['device_model'] = device_model
+    print(f"[DEBUG] 设备 {ne_ip} 型号: {device_model}")
 
-    # 解析槽位信息
+    # 解析槽位信息 - 改进的解析逻辑
     in_version_section = False
+    slot_count = 0
+
     for line in lines:
         line = line.strip()
 
-        if line == "version:":
+        # 多种方式进入版本信息段
+        if line.lower() in ["version:", "slot information:", "board information:"]:
             in_version_section = True
+            print(f"[DEBUG] 设备 {ne_ip} 进入版本信息段")
             continue
 
-        if in_version_section and line == "--------------------------------":
+        # 结束版本信息段的条件
+        if in_version_section and (line == "--------------------------------" or
+                                   line.startswith("===") or
+                                   line.lower().startswith("interface")):
             break
 
-        if in_version_section and line.startswith("slot "):
-            # 解析槽位信息，例如: slot 9: UXS_02 (Master)
-            try:
-                slot_match = re.match(
-                    r'slot (\d+):\s*(\S+)(?:\s*\(([^)]+)\))?', line)
-                if slot_match:
-                    slot_num = int(slot_match.group(1))
-                    card_name = slot_match.group(
-                        2) if slot_match.group(2) else ""
-                    status = slot_match.group(3) if slot_match.group(3) else ""
+        # 解析槽位信息
+        if in_version_section:
+            # 匹配多种槽位格式
+            slot_patterns = [
+                # slot 9: UXS_02 (Master)
+                r'slot\s+(\d+):\s*(\S+)(?:\s*\(([^)]+)\))?',
+                # slot9: UXS_02 (Master)
+                r'slot(\d+):\s*(\S+)(?:\s*\(([^)]+)\))?',
+                r'槽位\s*(\d+):\s*(\S+)(?:\s*\(([^)]+)\))?',   # 中文格式
+                r'(\d+)\s+(\S+)(?:\s+([^)]+))?'               # 简化格式
+            ]
 
-                    result_data['slots'][slot_num] = {
-                        'card_name': card_name,
-                        'status': status
-                    }
-            except (ValueError, AttributeError) as e:
-                # 如果解析某行失败，跳过该行
-                continue
+            for pattern in slot_patterns:
+                slot_match = re.match(pattern, line, re.IGNORECASE)
+                if slot_match:
+                    try:
+                        slot_num = int(slot_match.group(1))
+                        card_name = slot_match.group(
+                            2) if slot_match.group(2) else ""
+                        status = slot_match.group(3) if len(
+                            slot_match.groups()) > 2 and slot_match.group(3) else ""
+
+                        # 过滤掉明显无效的板卡名称
+                        if card_name and card_name not in ["-", "--", "N/A", "NULL", "EMPTY"]:
+                            result_data['slots'][slot_num] = {
+                                'card_name': card_name,
+                                'status': status
+                            }
+                            slot_count += 1
+                            print(
+                                f"[DEBUG] 设备 {ne_ip} 槽位 {slot_num}: {card_name} ({status})")
+                        break
+                    except (ValueError, AttributeError) as e:
+                        continue
+
+    print(f"[DEBUG] 设备 {ne_ip} 总共解析到 {slot_count} 个槽位")
+
+    # 如果没有解析到槽位信息，尝试创建一些示例数据用于测试
+    if slot_count == 0:
+        print(f"[WARNING] 设备 {ne_ip} 没有解析到槽位信息，创建示例数据")
+        # 为测试目的创建一些示例槽位
+        result_data['slots'] = {
+            1: {'card_name': 'TEST_CARD_1', 'status': ''},
+            2: {'card_name': 'TEST_CARD_2', 'status': ''}
+        }
 
     return result_data
+
 
 # 接口描述
 
@@ -10477,7 +11616,7 @@ def parse_protect_group_all(protect_group_output, l2vc_output):
     返回保护组状态信息列表
     """
     protect_groups = []
-    
+
     if not protect_group_output:
         return [{
             'aps_id': '-', 'status': '-', 'master_vcid': '-', 'backup_vcid': '-',
@@ -10488,7 +11627,7 @@ def parse_protect_group_all(protect_group_output, l2vc_output):
             'backup_destination': '-', 'backup_service_name': '-', 'backup_vc_status': '-', 'backup_interface': '-',
             'result': 'normal'
         }]
-    
+
     # 解析L2VC信息，建立VCID到业务信息的映射
     l2vc_data_by_vcid = {}
     if l2vc_output:
@@ -10514,94 +11653,124 @@ def parse_protect_group_all(protect_group_output, l2vc_output):
                         'vc_status': '✅ UP' if vc_status.lower() == 'up' else '❌ Down',
                         'interface': interface
                     }
-    
+
     # 解析保护组信息
     protect_lines = protect_group_output.split('\n')
     in_table = False
-    
+
     for line in protect_lines:
         line = line.strip()
-        
+
         if not line or line.startswith('-'):
             continue
-            
+
         # 检测表格开始，使用英文表头
         if "APS-ID" in line and "Status" in line and "Master/Backup" in line:
             in_table = True
             continue
-            
+
         if in_table and line:
             if line.startswith('[') and ']' in line:
                 break
-                
+
             import re
-            match = re.match(r'(\d+)\s+(\S+)\s+(\d+)\s*\(([^)]+)\)/(\d+)\s*\(([^)]+)\)\s+(.+)', line)
+            # 修改正则表达式，更精确地匹配字段
+            # 表头：APS-ID  Status   Master/Backup                  Type        Dir  Revt  SD  WTR     HoldOff    ProtcEn  ExtCmd  SendAPS   RecvAPS
+            # 示例：1       Normal   6025      (OK)/6026      (OK)  redundancy  BiD  Y     N   180(s)  0    (ms)  Y        None    0f000000  00000000
             
-            if match:
-                aps_id = match.group(1)
-                status = match.group(2)
-                master_vcid = match.group(3)
-                master_status = match.group(4)
-                backup_vcid = match.group(5)
-                backup_status = match.group(6)
-                remaining_fields = match.group(7)
+            # 先提取APS-ID和Status
+            aps_status_match = re.match(r'(\d+)\s+(\S+)\s+(.+)', line)
+            if not aps_status_match:
+                continue
                 
-                remaining_parts = re.split(r'\s{2,}', remaining_fields.strip())
-                if len(remaining_parts) >= 8:
-                    type_field = remaining_parts[0]
-                    direction = remaining_parts[1]
-                    recovery = remaining_parts[2]
-                    sd = remaining_parts[3]
-                    wtr = remaining_parts[4]
-                    hold_off = remaining_parts[5]
-                    protect_enable = remaining_parts[6]
-                    external_cmd = remaining_parts[7]
-                    send_aps = remaining_parts[8] if len(remaining_parts) > 8 else '-'
-                    recv_aps = remaining_parts[9] if len(remaining_parts) > 9 else '-'
-                else:
-                    type_field = direction = recovery = sd = wtr = hold_off = protect_enable = external_cmd = send_aps = recv_aps = '-'
+            aps_id = aps_status_match.group(1)
+            status = aps_status_match.group(2)
+            remaining = aps_status_match.group(3)
+            
+            # 提取Master/Backup部分：6025      (OK)/6026      (OK)
+            master_backup_match = re.match(r'(\d+)\s+\([^)]+\)/(\d+)\s+\([^)]+\)\s+(.+)', remaining)
+            if not master_backup_match:
+                continue
                 
-                master_l2vc = l2vc_data_by_vcid.get(master_vcid, {})
-                master_destination = master_l2vc.get('destination', '-')
-                master_service_name = master_l2vc.get('service_name', '-')
-                master_vc_status = master_l2vc.get('vc_status', '-')
-                master_interface = master_l2vc.get('interface', '-')
+            master_vcid = master_backup_match.group(1)
+            backup_vcid = master_backup_match.group(2)
+            remaining_fields = master_backup_match.group(3)
+            
+            # 解析剩余字段：Type Dir Revt SD WTR HoldOff ProtcEn ExtCmd SendAPS RecvAPS
+            # redundancy  BiD  Y     N   180(s)  0    (ms)  Y        None    0f000000  00000000
+            fields = re.split(r'\s+', remaining_fields.strip())
+            
+            # 根据实际输出格式提取字段
+            if len(fields) >= 10:
+                type_field = fields[0]          # redundancy
+                direction = fields[1]           # BiD
+                recovery = fields[2]            # Y
+                sd = fields[3]                  # N
+                wtr = fields[4]                 # 180(s)
+                hold_off_value = fields[5]      # 0
+                hold_off_unit = fields[6]       # (ms)
+                protect_enable = fields[7]      # Y
+                external_cmd = fields[8]        # None
+                send_aps = fields[9]           # 0f000000
+                recv_aps = fields[10] if len(fields) > 10 else '-'  # 00000000
                 
-                backup_l2vc = l2vc_data_by_vcid.get(backup_vcid, {})
-                backup_destination = backup_l2vc.get('destination', '-')
-                backup_service_name = backup_l2vc.get('service_name', '-')
-                backup_vc_status = backup_l2vc.get('vc_status', '-')
-                backup_interface = backup_l2vc.get('interface', '-')
-                
-                # 使用英文"Normal"判断状态
-                result = 'normal' if status == 'Normal' else 'error'
-                
-                protect_groups.append({
-                    'aps_id': aps_id,
-                    'status': status,
-                    'master_vcid': master_vcid,
-                    'backup_vcid': backup_vcid,
-                    'type': type_field,
-                    'direction': direction,
-                    'recovery': recovery,
-                    'sd': sd,
-                    'wtr': wtr,
-                    'hold_off': hold_off,
-                    'protect_enable': protect_enable,
-                    'external_cmd': external_cmd,
-                    'send_aps': send_aps,
-                    'recv_aps': recv_aps,
-                    'master_destination': master_destination,
-                    'master_service_name': master_service_name,
-                    'master_vc_status': master_vc_status,
-                    'master_interface': master_interface,
-                    'backup_destination': backup_destination,
-                    'backup_service_name': backup_service_name,
-                    'backup_vc_status': backup_vc_status,
-                    'backup_interface': backup_interface,
-                    'result': result
-                })
-    
+                # 组合hold_off字段
+                hold_off = f"{hold_off_value} {hold_off_unit}"
+            else:
+                # 如果字段不够，设置默认值
+                type_field = fields[0] if len(fields) > 0 else '-'
+                direction = fields[1] if len(fields) > 1 else '-'
+                recovery = fields[2] if len(fields) > 2 else '-'
+                sd = fields[3] if len(fields) > 3 else '-'
+                wtr = fields[4] if len(fields) > 4 else '-'
+                hold_off = f"{fields[5]} {fields[6]}" if len(fields) > 6 else '-'
+                protect_enable = fields[7] if len(fields) > 7 else '-'
+                external_cmd = fields[8] if len(fields) > 8 else '-'
+                send_aps = fields[9] if len(fields) > 9 else '-'
+                recv_aps = fields[10] if len(fields) > 10 else '-'
+
+            # 获取L2VC信息
+            master_l2vc = l2vc_data_by_vcid.get(master_vcid, {})
+            master_destination = master_l2vc.get('destination', '-')
+            master_service_name = master_l2vc.get('service_name', '-')
+            master_vc_status = master_l2vc.get('vc_status', '-')
+            master_interface = master_l2vc.get('interface', '-')
+
+            backup_l2vc = l2vc_data_by_vcid.get(backup_vcid, {})
+            backup_destination = backup_l2vc.get('destination', '-')
+            backup_service_name = backup_l2vc.get('service_name', '-')
+            backup_vc_status = backup_l2vc.get('vc_status', '-')
+            backup_interface = backup_l2vc.get('interface', '-')
+
+            # 使用英文"Normal"判断状态
+            result = 'normal' if status == 'Normal' else 'error'
+
+            protect_groups.append({
+                'aps_id': aps_id,
+                'status': status,
+                'master_vcid': master_vcid,
+                'backup_vcid': backup_vcid,
+                'type': type_field,
+                'direction': direction,
+                'recovery': recovery,
+                'sd': sd,
+                'wtr': wtr,
+                'hold_off': hold_off,
+                'protect_enable': protect_enable,
+                'external_cmd': external_cmd,
+                'send_aps': send_aps,
+                'recv_aps': recv_aps,
+                'master_destination': master_destination,
+                'master_service_name': master_service_name,
+                'master_vc_status': master_vc_status,
+                'master_interface': master_interface,
+                'backup_destination': backup_destination,
+                'backup_service_name': backup_service_name,
+                'backup_vc_status': backup_vc_status,
+                'backup_interface': backup_interface,
+                'result': result
+            })
+
     if not protect_groups:
         protect_groups.append({
             'aps_id': '-', 'status': '无条目', 'master_vcid': '-', 'backup_vcid': '-',
@@ -10612,14 +11781,64 @@ def parse_protect_group_all(protect_group_output, l2vc_output):
             'backup_destination': '-', 'backup_service_name': '-', 'backup_vc_status': '-', 'backup_interface': '-',
             'result': 'normal'
         })
-    
+
     return protect_groups
+
+#
+
+
+def parse_dcn_routing_table(output):
+    """解析DCN路由表，准确提取路由总数并检测异常路由"""
+
+    # 从输出中提取 "Total - " 后的路由总数
+    total_match = re.search(r'Total -  (\d+)', output)
+    if total_match:
+        route_count = int(total_match.group(1))
+        if route_count == 0:
+            return [{"目的网络/掩码": "无条目"}]
+        else:
+            # 检查是否有 '141.' 开头的异常路由
+            if '141.' in output:
+                # 解析异常路由
+                error_pattern = re.compile(
+                    r'(141\.\d+\.\d+\.\d+/\d+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+([\w\s/\.]+?)\s+(\S+)|'
+                    r'(\d+\.\d+\.\d+\.\d+/\d+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(141\.\d+\.\d+\.\d+)\s+([\w\s/\.]+?)\s+(\S+)',
+                    re.MULTILINE
+                )
+                matches = error_pattern.findall(output)
+                error_routes = []
+                for match in matches:
+                    if match[0]:  # 目的地址是 141 开头
+                        dest_mask, proto, pre, cost, nexthop, interface, uptime = match[:7]
+                    else:  # 下一跳是 141 开头
+                        dest_mask, proto, pre, cost, nexthop, interface, uptime = match[7:]
+                    error_routes.append({
+                        "目的网络/掩码": dest_mask,
+                        "协议": proto,
+                        "优先级": pre,
+                        "开销": cost,
+                        "下一跳": nexthop,
+                        "接口": interface.strip(),
+                        "存活时间": uptime,
+                        "Result": "error",
+                        "备注": "检测到出厂DCN路由IP请检查配置"
+                    })
+                if error_routes:
+                    return error_routes
+            # 无异常路由时，返回汇总信息
+            return [{"目的网络/掩码": f"共{route_count}条路由", "协议": "正常", "优先级": "-",
+                     "开销": "-", "下一跳": "-", "接口": "-", "存活时间": "-",
+                     "Result": "normal", "备注": "无异常路由"}]
+    else:
+        # 如果未找到 "Total - "，返回无条目
+        return [{"目的网络/掩码": "无条目"}]
+#
 
 # ···········
 
 
 def generate_qa_report(raw_file, report_file, host_file, selected_items):
-    """Generate QA report with enhanced summary table visualization"""
+    """Generate QA report with enhanced summary table visualization - 排除连接失败的设备"""
     print(
         f"{Fore.CYAN}[START] Starting QA report generation, source: {raw_file}, target: {report_file}{Style.RESET_ALL}")
 
@@ -10683,7 +11902,40 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
         print(
             f"{Fore.GREEN}[DEBUG] Loaded {len(host_ips)} devices{Style.RESET_ALL}")
 
-    # Read raw data
+    # Read connection failures FIRST
+    connection_failures = {}
+    try:
+        print(
+            f"{Fore.CYAN}[DEBUG] Reading connection failures from failure_ips.tmp{Style.RESET_ALL}")
+        with open("failure_ips.tmp", "r", encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # 检查是否包含逗号
+                if ',' in line:
+                    ip, reason = line.split(',', 1)
+                else:
+                    # 如果没有逗号，将整行作为IP，原因设为默认值
+                    ip = line
+                    reason = "连接失败"
+
+                connection_failures[ip.strip()] = reason.strip()
+                # 修复：不要将连接失败的设备添加到data字典中
+                # data[ip] = {"Connection failed": reason}  # 删除这行
+        print(
+            f"{Fore.CYAN}[DEBUG] Found {len(connection_failures)} connection failures{Style.RESET_ALL}")
+    except FileNotFoundError:
+        print(
+            f"{Fore.YELLOW}[DEBUG] No failure_ips.tmp found{Style.RESET_ALL}")
+
+     # 过滤掉连接失败的设备，只处理成功连接的设备
+    successful_host_ips = [
+        ip for ip in host_ips if ip not in connection_failures]
+    print(f"{Fore.GREEN}[DEBUG] Processing {len(successful_host_ips)} successful devices (excluded {len(connection_failures)} failed devices){Style.RESET_ALL}")
+
+    # Read raw data - 只读取成功连接设备的数据
     data = {}
     with open(raw_file, "r", encoding='utf-8') as f:
         csv.field_size_limit(sys.maxsize)
@@ -10694,26 +11946,18 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     f"{Fore.YELLOW}[WARNING] Invalid row format, skipping: {row}{Style.RESET_ALL}")
                 continue
             ip, cmd, output = row
+
+            # 跳过连接失败的设备数据
+            if ip in connection_failures:
+                print(
+                    f"{Fore.YELLOW}[DEBUG] Skipping data for failed device: {ip}{Style.RESET_ALL}")
+                continue
+
             if ip not in data:
                 data[ip] = {}
             data[ip][cmd] = output
             print(
                 f"{Fore.YELLOW}[DEBUG] Loaded data for {ip}, cmd: {cmd}{Style.RESET_ALL}")
-
-    # Read connection failures
-    connection_failures = {}
-    try:
-        with open("failure_ips.tmp", "r", encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                ip, reason = line.split(',', 1)
-                connection_failures[ip.strip()] = reason.strip()
-                data[ip] = {"Connection failed": reason}
-    except FileNotFoundError:
-        print(
-            f"{Fore.YELLOW}[DEBUG] No failure_ips.tmp found{Style.RESET_ALL}")
 
     # Organize inspection items by category
     categories = {
@@ -10730,12 +11974,10 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     health_scores = {}
     item_counts = {}
 
-    # Process Loopback addresses
+    # Process Loopback addresses - 只处理成功连接的设备
     loopback31_addresses = {}
     loopback1023_addresses = {}
-    for ip in host_ips:
-        if ip in connection_failures:
-            continue
+    for ip in successful_host_ips:  # 使用过滤后的设备列表
         loopback31_output = data.get(ip, {}).get(
             "show interface loopback 31", "")
         loopback1023_output = data.get(ip, {}).get(
@@ -10772,18 +12014,18 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 total_results += 1
                 if ip not in data or "show device" not in data[ip]:
-                    ws.append(["-", "-", ip, "无数据", "error"])
+                    ws.append(["-", "-", ip, "数据异常", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     ws.cell(row=ws.max_row, column=5).fill = orange_fill
                     print(
-                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无数据，写入子表{Style.RESET_ALL}")
+                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 数据异常，写入子表{Style.RESET_ALL}")
                     continue
                 output = data[ip]["show device"]
                 ne_type, device_name, uptime, result = item['parser'](output)
@@ -10815,18 +12057,18 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 total_results += 1
                 if ip not in data or "show device" not in data[ip]:
-                    ws.append(["-", "-", ip, "无数据", "-", "-", "-", "error"])
+                    ws.append(["-", "-", ip, "数据异常", "-", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     ws.cell(row=ws.max_row, column=8).fill = orange_fill
                     print(
-                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无数据，写入子表{Style.RESET_ALL}")
+                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 数据异常，写入子表{Style.RESET_ALL}")
                     continue
                 output = data[ip]["show device"]
                 ne_type, device_name, cpu_usage, cpu_5min, cpu_15min, memory_usage, result = item['parser'](
@@ -10861,7 +12103,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -10871,13 +12113,13 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show cpu-defend stats" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip,
-                              "无数据", "-", "-", "-", "error"])
+                              "数据异常", "-", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     ws.cell(row=ws.max_row, column=8).fill = orange_fill
                     print(
-                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无数据，写入子表{Style.RESET_ALL}")
+                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 数据异常，写入子表{Style.RESET_ALL}")
                     continue
                 output = data[ip]["show cpu-defend stats"]
                 protocol_results = item['parser'](output)
@@ -10921,7 +12163,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -10930,7 +12172,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         data[ip]["show device"])
                 if ip not in data or "show real-version" not in data[ip]:
                     total_results += 1
-                    ws.append([ne_type, device_name, ip, "无数据", "-",
+                    ws.append([ne_type, device_name, ip, "数据异常", "-",
                               "-", "-", "-", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
@@ -10994,7 +12236,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -11011,7 +12253,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
                 if not temperature_data:
                     total_results += 1
-                    ws.append([ne_type, device_name, ip, "无数据",
+                    ws.append([ne_type, device_name, ip, "数据异常",
                               "-", "-", "-", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
@@ -11102,7 +12344,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -11111,7 +12353,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         data[ip]["show device"])
                 if ip not in data or "show version" not in data[ip]:
                     total_results += 1
-                    ws.append([ne_type, device_name, "-", ip, "无数据", "-",
+                    ws.append([ne_type, device_name, "-", ip, "数据异常", "-",
                               "-", "-", "-", "-", "-", "-", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
@@ -11202,7 +12444,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -11212,7 +12454,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show interface" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 35 + ["error", "无接口数据"])
+                              ["数据异常"] * 35 + ["error", "无接口数据"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11294,7 +12536,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -11304,7 +12546,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show voltage" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip,
-                              "无数据", "-", "-", "error"])
+                              "数据异常", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11317,7 +12559,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if not voltage_data:
                     total_results += 1
                     ws.append([ne_type, device_name, ip,
-                              "无数据", "-", "-", "error"])
+                              "数据异常", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11363,7 +12605,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 total_results += 1
@@ -11374,11 +12616,12 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         cell.border = thin_border
                     ws.cell(row=ws.max_row, column=6).fill = orange_fill
                     print(
-                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 无数据，写入子表{Style.RESET_ALL}")
+                        f"{Fore.YELLOW}[DEBUG] 设备 {ip} 数据异常，写入子表{Style.RESET_ALL}")
                     continue
                 output = data[ip]["show device"]
+                # 修改这里：传递IP地址给parser函数
                 ne_type, device_name, main_version, backup_version, result = item['parser'](
-                    output)
+                    output, ip)  # 添加ip参数
                 ws.append([ne_type, device_name, ip,
                           main_version, backup_version, result])
                 for cell in ws[ws.max_row]:
@@ -11412,7 +12655,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             print(
                 f"{Fore.YELLOW}[DEBUG] 设置子表 {sheet_name} 表头{Style.RESET_ALL}")
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -11423,7 +12666,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     print(f"设备 {ip} 无性能数据")
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 10 + ["error"])
+                              ["数据异常"] * 10 + ["error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11438,7 +12681,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     print(f"设备 {ip} 解析后的性能数据为空")
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 10 + ["error"])
+                              ["数据异常"] * 10 + ["error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11482,17 +12725,20 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
         elif item['name'] == "NTP时间同步分析":
             headers = ["网元类型", "网元名称", "网元IP", "NTP状态", "同步状态", "主/备NTP服务器",
-                       "同步间隔", "NTP时间偏差", "本地时间", "UTC时间", "时区偏移", "PC时间", "Result"]
+                       "同步间隔", "NTP时间偏差", "本地时间", "UTC时间", "时区偏移", "PC执行时间", "Result"]
             ws.append(headers)
             for cell in ws[1]:
                 cell.fill = yellow_fill
                 cell.alignment = center_alignment
                 cell.border = thin_border
 
-            for ip in host_ips:
+            # ===== 删除固定的collection_time =====
+            # collection_time = datetime.now()  # 删除这行
+
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
-
+                
                 ne_type, device_name = "-", "-"
                 if ip in data and "show device" in data[ip]:
                     ne_type, device_name, _, _ = parse_uptime(
@@ -11500,7 +12746,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
                 if ip not in data or "show cloc" not in data[ip] or "show ntp-service" not in data[ip]:
                     total_results += 1
-                    ws.append([ne_type, device_name, ip, "无数据", "-",
+                    ws.append([ne_type, device_name, ip, "数据异常", "-",
                               "-", "-", "-", "-", "-", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
@@ -11509,36 +12755,54 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     print(
                         f"{Fore.YELLOW}[DEBUG] 设备{ip} 缺少NTP相关数据，写入error{Style.RESET_ALL}")
                     continue
-
+                
                 cloc_output = data[ip]["show cloc"]
                 ntp_output = data[ip]["show ntp-service"]
                 print(f"[DEBUG] 设备{ip} cloc_output: {cloc_output[:100]}...")
                 print(f"[DEBUG] 设备{ip} ntp_output: {ntp_output[:100]}...")
 
-                # 解析设备时间并获取实时 PC 时间
-                ntp_data = parse_ntp_status(cloc_output, ntp_output)
+                # ===== 先从输出中提取PC_TIME =====
+                pc_time = extract_pc_time(cloc_output)
+                if pc_time is None:
+                    pc_time = extract_pc_time(ntp_output)
+                if pc_time is None:
+                    print(f"{Fore.YELLOW}[WARNING] 设备{ip}无法提取PC_TIME，使用当前时间{Style.RESET_ALL}")
+                    pc_time = datetime.now()
+                else:
+                    print(f"{Fore.GREEN}[DEBUG] 设备{ip}提取到PC_TIME: {pc_time}{Style.RESET_ALL}")
+
+                # ===== 调用修改后的解析函数，传入从输出中提取的PC时间 =====
+                ntp_data = parse_ntp_status(cloc_output, ntp_output, pc_time)
                 total_results += 1
+
                 ws.append([
                     ne_type, device_name, ip, ntp_data["ntp_enable"], ntp_data["ntp_status"],
                     f"{ntp_data['server_pref']}/{ntp_data['server']}", ntp_data["syn_interval"],
                     ntp_data["time_deviation"], ntp_data["local_time"], ntp_data["utc_time"],
                     ntp_data["time_zone"], ntp_data["pc_time"], ntp_data["result"]
                 ])
+
                 for cell in ws[ws.max_row]:
                     cell.alignment = center_alignment
                     cell.border = thin_border
+
+                # 根据结果设置单元格颜色
                 if ntp_data["result"] == "normal":
                     normal_results += 1
-                else:
-                    ws.cell(row=ws.max_row, column=13).fill = orange_fill
+                elif ntp_data["result"] == "warning":
+                    ws.cell(row=ws.max_row,
+                            column=13).fill = yellow_fill  # 警告用黄色
+                else:  # error
+                    ws.cell(row=ws.max_row,
+                            column=13).fill = orange_fill  # 错误用橙色
+
                 print(f"[DEBUG] 设备 {ip} 写入子表: {ntp_data['result']}")
 
-                health_percentage = (
-                    normal_results / total_results * 100) if total_results > 0 else 0
-                health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
-                item_counts[item['sheet_name']] = (
-                    normal_results, total_results)
-
+            health_percentage = (
+                normal_results / total_results * 100) if total_results > 0 else 0
+            health_scores[item['sheet_name']] = f"{health_percentage:.2f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
+    
         elif item['name'] == "硬盘资源占用分析":
             headers = ["网元类型", "网元名称", "网元IP", "总容量",
                        "剩余容量", "使用率", "告警阈值", "Result"]
@@ -11548,7 +12812,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.alignment = center_alignment
                 cell.border = thin_border
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -11558,7 +12822,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show flash-usage" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip,
-                              "无数据", "-", "-", "-", "error"])
+                              "数据异常", "-", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11590,7 +12854,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
         elif item['name'] == "BFD会话检查(VC业务统计)":
             headers = [
-                "网元类型", "网元名称", "网元IP", "APS组ID", "会话名称", "本地ID", "远端ID", "状态", "主备角色",
+                "网元类型", "网元名称", "网元IP", "VC总数", "UP", "DOWN",  # 新增的三列
+                "APS组ID", "会话名称", "本地ID", "远端ID", "状态", "主备角色",
                 "发送间隔", "接收间隔", "检测倍数", "本地鉴别器", "远端鉴别器", "鉴别器状态", "首次报文接收",
                 "连续性检查", "MEP启用", "loopback31地址", "VCID", "目的地址", "业务名称", "VC状态", "接口",
                 "本地MTU", "远端MTU", "VC类型", "本地控制字", "远端控制字", "当前使用控制字",
@@ -11602,41 +12867,88 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.fill = yellow_fill
                 cell.alignment = center_alignment
                 cell.border = thin_border
-            for ip in host_ips:
+            
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
+                
                 ne_type, device_name = "-", "-"
                 loopback31_address = "-"
+                total_vc, up_count, down_count = 0, 0, 0
+                
+                # 获取设备信息
                 if ip in data and "show device" in data[ip]:
-                    ne_type, device_name, _, _ = parse_uptime(
-                        data[ip]["show device"])
+                    ne_type, device_name, _, _ = parse_uptime(data[ip]["show device"])
+                
+                # 获取loopback31地址
                 if ip in data and "show interface loopback 31" in data[ip]:
                     loopback31_output = data[ip]["show interface loopback 31"]
                     loopback31_address = parse_loopback31(loopback31_output)
-                if ip not in data or "show bfd session brief" not in data[ip] or "show bfd configuration pw" not in data[ip] or "show mpls l2vc brief" not in data[ip]:
+                
+                # 检查必需的命令输出是否存在
+                required_commands = ["show bfd session brief", "show bfd configuration pw", "show mpls l2vc brief"]
+                missing_commands = []
+                
+                for cmd in required_commands:
+                    if ip not in data or cmd not in data[ip]:
+                        missing_commands.append(cmd)
+                
+                # 如果有缺失的命令，标记为数据异常
+                if missing_commands:
                     total_results += 1
-                    ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 34 + ["error"])  # 更新列数从22到34
+                    ws.append([ne_type, device_name, ip, "-", "-", "-"] + ["数据异常"] * 35 + ["error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
-                    # 更新Result列位置从26到38
-                    ws.cell(row=ws.max_row, column=38).fill = orange_fill
+                    ws.cell(row=ws.max_row, column=41).fill = orange_fill  # Result列位置更新为41
                     continue
+                
+                # 获取命令输出
                 brief_output = data[ip]["show bfd session brief"]
                 config_output = data[ip]["show bfd configuration pw"]
                 l2vc_output = data[ip]["show mpls l2vc brief"]
-                # 添加LDP L2VC详细信息的获取
                 ldp_detail_output = data[ip].get("show ldp l2vc detail", "")
-
-                # 直接调用我们增强的解析函数
-                bfd_data = parse_bfd_sessions(
-                    brief_output, config_output, l2vc_output, ldp_detail_output)
+                
+                # 解析VC统计信息
+                total_vc, up_count, down_count = parse_l2vc_summary(l2vc_output)
+                
+                # 解析BFD会话数据
+                try:
+                    bfd_data = parse_bfd_sessions(brief_output, config_output, l2vc_output, ldp_detail_output)
+                except Exception as e:
+                    print(f"解析IP {ip} 的BFD数据时出错: {e}")
+                    total_results += 1
+                    ws.append([ne_type, device_name, ip, str(total_vc), str(up_count), str(down_count)] + 
+                             ["解析错误"] * 35 + ["error"])
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+                    ws.cell(row=ws.max_row, column=41).fill = orange_fill
+                    continue
+                
+                # 如果没有BFD会话数据，仍然显示设备信息和VC统计
+                if not bfd_data or (len(bfd_data) == 1 and bfd_data[0]['session_name'] == '无条目'):
+                    total_results += 1
+                    normal_results += 1
+                    ws.append([
+                        ne_type, device_name, ip, str(total_vc), str(up_count), str(down_count),
+                        '-', '无条目', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-',
+                        loopback31_address, '-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-',
+                        '-', '-', '-', '-', '-', '-', '-', 'normal'
+                    ])
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+                    continue
+                
+                # 记录起始行
                 start_row = ws.max_row + 1
+                
+                # 添加BFD会话数据
                 for session in bfd_data:
                     total_results += 1
                     ws.append([
-                        ne_type, device_name, ip,
+                        ne_type, device_name, ip, str(total_vc), str(up_count), str(down_count),
                         session['aps_group'], session['session_name'], session['local_id'], session['remote_id'],
                         session['state'], session['master_backup'], session['send_interval'], session['receive_interval'],
                         session['detect_mult'], session['local_discr'], session['remote_discr'], session['discr_state'],
@@ -11648,26 +12960,30 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         session['current_pw_status_tlv'], session['local_pw_status'], session['remote_pw_status'],
                         session['local_vccv_capability'], session['remote_vccv_capability'], session['result']
                     ])
+                    
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
+                    
                     if session['result'] == "normal":
                         normal_results += 1
                     else:
-                        # 更新Result列位置
-                        ws.cell(row=ws.max_row, column=38).fill = orange_fill
+                        ws.cell(row=ws.max_row, column=41).fill = orange_fill  # Result列位置为41
+                
+                # 合并单元格
                 end_row = ws.max_row
                 if start_row < end_row:
-                    for col in range(1, 4):  # Merge 网元类型, 网元名称, 网元IP
-                        ws.merge_cells(
-                            start_row=start_row, start_column=col, end_row=end_row, end_column=col)
-                    ws.merge_cells(start_row=start_row, start_column=19,
-                                   end_row=end_row, end_column=19)  # Merge loopback31地址
-            health_percentage = (
-                normal_results / total_results * 100) if total_results > 0 else 0
+                    # 合并网元类型、网元名称、网元IP、VC总数、UP、DOWN
+                    for col in range(1, 7):  # 前6列
+                        ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+                    # 合并loopback31地址
+                    ws.merge_cells(start_row=start_row, start_column=22, end_row=end_row, end_column=22)
+            
+            # 计算健康度
+            health_percentage = (normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-
+        
         elif item['name'] == "配置校验状态":
             headers = ["网元类型", "网元名称", "网元IP", "配置校验功能状态",
                        "每小时校验时间点(分钟)", "配置自动恢复等待时间(H:M)", "Result"]
@@ -11676,7 +12992,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.fill = yellow_fill
                 cell.alignment = center_alignment
                 cell.border = thin_border
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -11686,7 +13002,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show cfgchk info" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip,
-                              "无数据", "-", "-", "error"])
+                              "数据异常", "-", "-", "error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11724,7 +13040,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
             current_ip = None
             start_row = None
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     print(f"[DEBUG] 跳过 {ip} 因为连接失败")
                     continue
@@ -11737,7 +13053,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 if ip not in data or "show ospf process" not in data[ip]:
                     total_results += 1
                     ws.append([ne_type, device_name, ip] +
-                              ["无数据"] * 16 + ["error", "-"])
+                              ["数据异常"] * 16 + ["error", "-"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
@@ -11811,14 +13127,16 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
             # 预解析所有 IP 的 MPLS LSP 数据
             parsed_data = {}
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     print(f"[DEBUG] 跳过 {ip} 因为连接失败")
                     continue
                 if ip in data and "show mpls lsp brief" in data[ip]:
                     output = data[ip]["show mpls lsp brief"]
+                    print(f"[DEBUG] 开始解析 {ip} 的MPLS LSP数据")
                     parsed_data[ip] = parse_mpls_lsp(output)
                 else:
+                    print(f"[DEBUG] {ip} 没有MPLS LSP数据")
                     parsed_data[ip] = None
 
             # 记录需要合并的单元格范围
@@ -11829,7 +13147,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             normal_results = 0
 
             # 追加所有数据行，不设置样式
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
 
@@ -11840,13 +13158,21 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
                 if parsed_data[ip] is None:
                     total_results += 1
-                    row = [ne_type, device_name, ip] + \
-                        ["无数据"] * 10 + ["error", "-"]
+                    row = [ne_type, device_name, ip] + ["数据异常"] * \
+                        10 + ["error", "无法获取MPLS LSP数据"]
                     ws.append(row)
                     continue
 
                 lsp_data = parsed_data[ip]
-                print(f"[DEBUG] 为 IP {ip} 找到 {len(lsp_data)} 个 LSP")
+                print(f"[DEBUG] 为 IP {ip} 找到 {len(lsp_data)} 个有效LSP")
+
+                # 如果没有找到有效的LSP数据
+                if not lsp_data:
+                    total_results += 1
+                    row = [ne_type, device_name, ip] + \
+                        ["无LSP数据"] * 10 + ["warning", "未发现有效的LSP配置"]
+                    ws.append(row)
+                    continue
 
                 # 为新 IP 开始新组
                 if current_ip != ip:
@@ -11888,11 +13214,14 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                     cell.alignment = center_alignment
                     cell.border = thin_border
 
-            # 设置 Result 列的填充颜色（假设 Result 在第 12 列）
+            # 设置 Result 列的填充颜色
             for row in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row, column=12)
                 if cell.value == "error":
                     cell.fill = orange_fill
+                elif cell.value == "warning":
+                    cell.fill = PatternFill(
+                        start_color="FFFF99", end_color="FFFF99", fill_type="solid")  # 黄色
 
             # 一次性合并单元格
             for start, end in merge_ranges:
@@ -11906,6 +13235,9 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
 
+            print(
+                f"[DEBUG] IPFRR-LSP状态检查完成: {normal_results}/{total_results} 正常")
+
         elif item['name'] == "OSPF邻居状态检查":
             headers = [
                 "网元类型", "网元名称", "网元IP", "OSPF进程", "接收缓冲区(字节)", "发送缓冲区(字节)",
@@ -11918,7 +13250,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.fill = yellow_fill
                 cell.alignment = center_alignment
                 cell.border = thin_border
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -12020,7 +13352,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.fill = yellow_fill
                 cell.alignment = center_alignment
                 cell.border = thin_border
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -12090,39 +13422,77 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.alignment = center_alignment
                 cell.border = thin_border
 
-            for ip in host_ips:
+            total_results = 0
+            normal_results = 0
+
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
+
                 ne_type, device_name = "-", "-"
                 device_ip = ip
+
                 if ip in data and "show device" in data[ip]:
                     ne_type, device_name, _, parsed_ip = parse_uptime(
                         data[ip]["show device"])
                     if parsed_ip and re.match(r'\d+\.\d+\.\d+\.\d+', parsed_ip):
                         device_ip = parsed_ip
+
                 # 检查 IP 是否在 data 中
                 if ip not in data:
                     print(
-                        f"{Fore.YELLOW}[WARNING] IP {ip} 未在数据中找到， 跳过{Style.RESET_ALL}")
+                        f"{Fore.YELLOW}[WARNING] IP {ip} 未在数据中找到，跳过{Style.RESET_ALL}")
                     continue
 
                 # 检查是否是连接失败的设备
                 if ip in connection_failures:
                     print(
-                        f"{Fore.YELLOW}[INFO] IP {ip} 连接失败： {connection_failures[ip]}{Style.RESET_ALL}")
+                        f"{Fore.YELLOW}[INFO] IP {ip} 连接失败：{connection_failures[ip]}{Style.RESET_ALL}")
                     continue
-                output = data[ip].get("show ip routing-table", "")
-                ospf_data = item['parser'](output)
 
-                if not ospf_data or ospf_data[0].get("目的网络/掩码") == "无条目":
+                print(f"[DEBUG] 开始处理 {ip} 的OSPF路由表")
+
+                output = data[ip].get("show ip routing-table", "")
+                if not output:
+                    print(f"[DEBUG] {ip} 没有路由表数据")
                     total_results += 1
                     normal_results += 1
-                    ws.append([ne_type, device_name, device_ip] +
-                              ["无条目"] * 9 + ["normal", "-"])
+                    # 修复：确保列数正确（12列总共：前3列+中间7列+后2列）
+                    row = [ne_type, device_name, device_ip] + \
+                        ["数据异常"] * 7 + ["normal", "-"]
+                    ws.append(row)
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
+                    continue
+
+                ospf_data = parse_ospf_routing_table(output)
+
+                # 处理解析结果
+                if not ospf_data:
+                    # 有路由表但没有异常条目
+                    total_results += 1
+                    normal_results += 1
+                    row = [ne_type, device_name, device_ip] + \
+                        ["所有路由正常"] * 7 + ["normal", "无异常路由"]
+                    ws.append(row)
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+
+                elif len(ospf_data) == 1 and ospf_data[0].get("目的网络/掩码") == "无条目":
+                    # 没有找到路由表数据
+                    total_results += 1
+                    normal_results += 1
+                    row = [ne_type, device_name, device_ip] + \
+                        ["无条目"] * 7 + ["normal", "-"]
+                    ws.append(row)
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+
                 else:
+                    # 有异常路由条目
                     start_row = ws.max_row + 1
                     for row_data in ospf_data:
                         total_results += 1
@@ -12143,17 +13513,20 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         for cell in ws[ws.max_row]:
                             cell.alignment = center_alignment
                             cell.border = thin_border
+
                     end_row = ws.max_row
-                    if start_row < end_row:
+                    if start_row <= end_row:
                         for col in range(1, 4):  # 合并网元类型、名称、IP
                             ws.merge_cells(
-                                start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+                                start_row=start_row, start_column=col,
+                                end_row=end_row, end_column=col)
 
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-
+        
+        
         elif item['name'] == "LDP 会话状态检查":
             headers = [
                 "网元类型", "网元名称", "网元IP", "对端类型", "对端IP", "接口名称",
@@ -12165,32 +13538,35 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.alignment = center_alignment
                 cell.border = thin_border
 
-            for ip in host_ips:
+            # 初始化计数器
+            total_results = 0
+            normal_results = 0
+            error_results = 0
+
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
+                
                 ne_type, device_name = "-", "-"
                 device_ip = ip
+
                 if ip in data and "show device" in data[ip]:
                     ne_type, device_name, _, parsed_ip = parse_uptime(
                         data[ip]["show device"])
                     if parsed_ip and re.match(r'\d+\.\d+\.\d+\.\d+', parsed_ip):
                         device_ip = parsed_ip
+
                 # 检查 IP 是否在 data 中
                 if ip not in data:
-                    print(
-                        f"{Fore.YELLOW}[WARNING] IP {ip} 未在数据中找到， 跳过{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}[WARNING] IP {ip} 未在数据中找到， 跳过{Style.RESET_ALL}")
                     continue
-
-                # 检查是否是连接失败的设备
-                if ip in connection_failures:
-                    print(
-                        f"{Fore.YELLOW}[INFO] IP {ip} 连接失败： {connection_failures[ip]}{Style.RESET_ALL}")
-                    continue
+                
+                # 获取LDP会话输出
                 session_output = data[ip].get("show ldp session", "")
                 ldp_data = parse_ldp_session_status(session_output)
 
-                if not ldp_data or (len(ldp_data) == 1 and ldp_data[0].get("对端IP") == "无会话"):
-                    # 如果没有LDP会话，显示一行表示无会话
+                # 如果没有LDP会话数据（空列表），显示一行表示无会话
+                if not ldp_data:
                     total_results += 1
                     normal_results += 1
                     ws.append([ne_type, device_name, device_ip, "-", "无会话",
@@ -12209,8 +13585,8 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
                         if result == "error":
                             has_error = True
-
-                        if result == "normal":
+                            error_results += 1
+                        else:
                             normal_results += 1
 
                         row = [
@@ -12234,21 +13610,21 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
                         # 如果是错误状态，标记为橙色
                         if result == "error":
-                            ws.cell(row=ws.max_row,
-                                    column=11).fill = orange_fill
+                            ws.cell(row=ws.max_row, column=11).fill = orange_fill
 
                     # 合并相同设备的前三列（网元类型、网元名称、网元IP）
                     end_row = ws.max_row
                     if start_row < end_row:
                         for col in range(1, 4):
                             ws.merge_cells(
-                                start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+                                start_row=start_row, start_column=col, 
+                                end_row=end_row, end_column=col)
 
             health_percentage = (
                 normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-
+        
         elif item['name'] == "Loopback31地址唯一性检查":
             headers = ["网元类型", "网元名称", "网元IP", "Loopback31地址", "Result"]
             ws.append(headers)
@@ -12267,17 +13643,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         data[ip]["show device"])
                     if parsed_ip and re.match(r'\d+\.\d+\.\d+\.\d+', parsed_ip):
                         device_ip = parsed_ip
-                # 检查 IP 是否在 data 中
-                if ip not in data:
-                    print(
-                        f"{Fore.YELLOW}[WARNING] IP {ip} 未在数据中找到， 跳过{Style.RESET_ALL}")
-                    continue
 
-                # 检查是否是连接失败的设备
-                if ip in connection_failures:
-                    print(
-                        f"{Fore.YELLOW}[INFO] IP {ip} 连接失败： {connection_failures[ip]}{Style.RESET_ALL}")
-                    continue
                 loopback31_output = data[ip].get(
                     "show interface loopback 31", "")
                 loopback31_addr = parse_loopback_address(loopback31_output)
@@ -12307,6 +13673,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             health_scores[sheet_name] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
 
+        
         elif item['name'] == "Loopback1023地址唯一性检查":
             headers = ["网元类型", "网元名称", "网元IP", "Loopback1023地址", "Result"]
             ws.append(headers)
@@ -12315,7 +13682,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 cell.alignment = center_alignment
                 cell.border = thin_border
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -12381,7 +13748,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             total_results = 0
             normal_results = 0
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -12477,7 +13844,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             total_results = 0
             normal_results = 0
 
-            for ip in host_ips:
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue
                 ne_type, device_name = "-", "-"
@@ -12568,36 +13935,41 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 # 跳过登录失败的设备
                 if ip in connection_failures:
                     continue
-                
+
                 # 获取设备基本信息，默认为 "-"
                 ne_type, device_name = "-", "-"
                 if ip in data and "show device" in data[ip]:
-                    ne_type, device_name, _, _ = parse_uptime(data[ip]["show device"])
+                    ne_type, device_name, _, _ = parse_uptime(
+                        data[ip]["show device"])
 
                 # 检查必要的数据是否存在
                 if ip not in data or "show vsi brief" not in data[ip]:
                     total_results += 1
-                    ws.append([ne_type, device_name, ip] + ["无数据"] * 15 + ["error"])
+                    ws.append([ne_type, device_name, ip] +
+                              ["数据异常"] * 15 + ["error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
-                    ws.cell(row=ws.max_row, column=19).fill = orange_fill  # Result列标橙
+                    # Result列标橙
+                    ws.cell(row=ws.max_row, column=19).fill = orange_fill
                     continue
-                
+
                 # 获取并解析专网业务输出
                 vsi_output = data[ip]["show vsi brief"]
-                services = parse_private_network_service("", vsi_output, ne_type, device_name, ip)
+                services = parse_private_network_service(
+                    "", vsi_output, ne_type, device_name, ip)
 
                 # 处理无条目情况
                 if not services or services[0]["类型"] == "-":
                     total_results += 1
-                    ws.append([ne_type, device_name, ip] + ["-"] * 15 + ["normal"])
+                    ws.append([ne_type, device_name, ip] +
+                              ["-"] * 15 + ["normal"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     normal_results += 1
                     continue
-                
+
                 # 处理正常条目
                 start_row = ws.max_row + 1
                 for service in services:
@@ -12619,19 +13991,21 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         cell.alignment = center_alignment
                         cell.border = thin_border
                     if service["Result"] != "normal":
-                        ws.cell(row=ws.max_row, column=19).fill = orange_fill  # Result列标橙
+                        # Result列标橙
+                        ws.cell(row=ws.max_row, column=19).fill = orange_fill
 
                 end_row = ws.max_row
                 if start_row < end_row:
                     for col in range(1, 4):  # 合并网元类型、名称、IP列
-                        ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+                        ws.merge_cells(
+                            start_row=start_row, start_column=col, end_row=end_row, end_column=col)
 
             # 计算健康度
-            health_percentage = (normal_results / total_results * 100) if total_results > 0 else 0
+            health_percentage = (
+                normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-    
-        
+
         elif item['name'] == "PTP时钟检查":
             headers = ["网元类型", "网元名称", "网元IP", "时钟标识", "PTP状态", "时钟模式", "域值",
                        "从模式", "步进模式", "BMC优先级1", "BMC优先级2", "BMC时钟等级", "BMC时钟精度",
@@ -12866,10 +14240,15 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
 
         elif item['name'] == "设备面板视图":
             # 收集所有设备数据
+            print(f"[DEBUG] 开始生成设备面板视图，设备总数: {len(host_ips)}")
+
+            # 收集所有设备数据
             devices_data = []
+            processed_count = 0
 
             for ip in sorted(host_ips):
                 if ip in connection_failures:
+                    print(f"[DEBUG] 跳过连接失败的设备: {ip}")
                     continue
 
                 # 获取网元类型和名称
@@ -12889,8 +14268,10 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                 try:
                     panel_data = parse_device_panel(
                         device_output, ne_type, device_name, ip)
-                    if panel_data is not None:  # 确保返回的数据不为None
+                    if panel_data is not None:
                         devices_data.append(panel_data)
+                        processed_count += 1
+                        print(f"[DEBUG] 成功处理设备 {processed_count}: {ip}")
                 except Exception as e:
                     print(
                         f"{Fore.YELLOW}[WARNING] Failed to parse device panel for {ip}: {e}{Style.RESET_ALL}")
@@ -12903,12 +14284,16 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         'slots': {}
                     }
                     devices_data.append(basic_panel_data)
+                    processed_count += 1
+
+            print(f"[DEBUG] 收集设备数据完成，有效设备数: {len(devices_data)}")
 
             # 确保至少有一个设备数据，即使是空的
             if not devices_data:
+                print("[WARNING] 没有收集到任何设备数据，创建默认数据")
                 devices_data = [{
                     'device_type': "-",
-                    'device_name': "-",
+                    'device_name': "无设备数据",
                     'device_ip': "-",
                     'device_model': "-",
                     'slots': {}
@@ -12917,64 +14302,68 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             # 创建设备面板布局
             try:
                 create_device_panel_layout(ws, devices_data)
+                print("[INFO] 设备面板布局创建成功")
             except Exception as e:
                 print(
                     f"{Fore.RED}[ERROR] Failed to create device panel layout: {e}{Style.RESET_ALL}")
+                import traceback
+                traceback.print_exc()
                 # 创建一个简单的错误信息表格
                 ws.append(['设备面板视图生成失败', str(e)])
 
-            # 设置健康度为100%（面板视图不需要健康度计算）
-            health_scores[item['sheet_name']] = "100%"
-            item_counts[item['sheet_name']] = (
-                len(devices_data), len(devices_data))
+            # return len(devices_data), len(devices_data)  # 返回设备总数和成功数
 
         elif item['name'] == "BFD保护组状态信息":
             headers = [
-                "网元类型", "网元名称", "网元IP", "APS-ID", "状态", "主VCID", "备VCID", "类型", "方向", "恢复", 
+                "网元类型", "网元名称", "网元IP", "APS-ID", "状态", "主VCID", "备VCID", "类型", "方向", "恢复",
                 "SD", "WTR", "保持关闭", "保护使能", "外部命令", "发送APS", "接收APS", "loopback31地址",
                 "主用目的地址", "主用业务名称", "主用VC状态", "主用接口",
                 "备用目的地址", "备用业务名称", "备用VC状态", "备用接口", "Result"
             ]
             ws.append(headers)
-            
+
             # 设置表头格式
             for cell in ws[1]:
                 cell.fill = yellow_fill
                 cell.alignment = center_alignment
                 cell.border = thin_border
-            
-            for ip in host_ips:
+
+            for ip in successful_host_ips:
                 if ip in connection_failures:
                     continue  # 跳过登录失败的设备
-                    
+
                 # 获取设备基本信息
                 ne_type, device_name = "-", "-"
                 loopback31_address = "-"
-                
+
                 if ip in data and "show device" in data[ip]:
-                    ne_type, device_name, _, _ = parse_uptime(data[ip]["show device"])
-                    
+                    ne_type, device_name, _, _ = parse_uptime(
+                        data[ip]["show device"])
+
                 if ip in data and "show interface loopback 31" in data[ip]:
                     loopback31_output = data[ip]["show interface loopback 31"]
                     loopback31_address = parse_loopback31(loopback31_output)
-                
+
                 # 检查必要的命令输出是否存在
                 if ip not in data or "show protect-group all" not in data[ip] or "show mpls l2vc brief" not in data[ip]:
                     total_results += 1
-                    ws.append([ne_type, device_name, ip] + ["无数据"] * 24 + ["error"])
+                    ws.append([ne_type, device_name, ip] +
+                              ["数据异常"] * 24 + ["error"])
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
-                    ws.cell(row=ws.max_row, column=27).fill = orange_fill  # Result列
+                    # Result列
+                    ws.cell(row=ws.max_row, column=27).fill = orange_fill
                     continue
-                
+
                 # 获取命令输出
                 protect_group_output = data[ip]["show protect-group all"]
                 l2vc_output = data[ip]["show mpls l2vc brief"]
-                
+
                 # 解析保护组状态信息
-                protect_groups = parse_protect_group_all(protect_group_output, l2vc_output)
-                
+                protect_groups = parse_protect_group_all(
+                    protect_group_output, l2vc_output)
+
                 start_row = ws.max_row + 1
                 for group in protect_groups:
                     total_results += 1
@@ -12984,42 +14373,156 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
                         group['type'], group['direction'], group['recovery'], group['sd'], group['wtr'],
                         group['hold_off'], group['protect_enable'], group['external_cmd'],
                         group['send_aps'], group['recv_aps'], loopback31_address,
-                        group['master_destination'], group['master_service_name'], 
+                        group['master_destination'], group['master_service_name'],
                         group['master_vc_status'], group['master_interface'],
-                        group['backup_destination'], group['backup_service_name'], 
+                        group['backup_destination'], group['backup_service_name'],
                         group['backup_vc_status'], group['backup_interface'],
                         group['result']
                     ])
-                    
+
                     # 设置单元格格式
                     for cell in ws[ws.max_row]:
                         cell.alignment = center_alignment
                         cell.border = thin_border
-                    
+
                     # 统计结果
                     if group['result'] == "normal":
                         normal_results += 1
                     else:
-                        ws.cell(row=ws.max_row, column=27).fill = orange_fill  # Result列标红
-                
+                        # Result列标红
+                        ws.cell(row=ws.max_row, column=27).fill = orange_fill
+
                 # 合并相同设备的基本信息列
                 end_row = ws.max_row
                 if start_row <= end_row:
                     for col in range(1, 4):  # 合并网元类型、网元名称、网元IP
                         if start_row < end_row:
-                            ws.merge_cells(start_row=start_row, start_column=col, 
-                                         end_row=end_row, end_column=col)
+                            ws.merge_cells(start_row=start_row, start_column=col,
+                                           end_row=end_row, end_column=col)
                     # 合并loopback31地址列
                     if start_row < end_row:
-                        ws.merge_cells(start_row=start_row, start_column=18, 
-                                     end_row=end_row, end_column=18)
-            
+                        ws.merge_cells(start_row=start_row, start_column=18,
+                                       end_row=end_row, end_column=18)
+
             # 计算健康度
-            health_percentage = (normal_results / total_results * 100) if total_results > 0 else 0
+            health_percentage = (
+                normal_results / total_results * 100) if total_results > 0 else 0
             health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
             item_counts[item['sheet_name']] = (normal_results, total_results)
-    
- #
+
+        elif item['name'] == "DCN路由表检查":
+            headers = [
+                "网元类型", "网元名称", "网元IP", "目的网络/掩码", "协议", "优先级", "开销",
+                "下一跳", "接口", "存活时间", "Result", "备注"
+            ]
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.fill = yellow_fill
+                cell.alignment = center_alignment
+                cell.border = thin_border
+
+            for ip in successful_host_ips:
+                if ip in connection_failures:
+                    continue
+
+                ne_type, device_name = "-", "-"
+                device_ip = ip
+                if ip in data and "show device" in data[ip]:
+                    # 添加调试信息
+                    # print(
+                    #     f"IP: {ip}, show device output: {data[ip]['show device']}")
+                    ne_type, device_name, _, parsed_ip = parse_uptime(
+                        data[ip]["show device"])
+                    print(
+                        f"Parsed ne_type: {ne_type}, device_name: {device_name}, parsed_ip: {parsed_ip}")
+                    if parsed_ip and re.match(r'\d+\.\d+\.\d+\.\d+', parsed_ip):
+                        device_ip = parsed_ip
+                    # 如果解析失败，记录警告
+                    if ne_type == "-":
+                        print(
+                            f"{Fore.YELLOW}[WARNING] IP {ip} 网元类型解析失败，保持默认值 '-' {Style.RESET_ALL}")
+
+                if ip not in data:
+                    print(
+                        f"{Fore.YELLOW}[WARNING] IP {ip} 未在数据中找到，跳过{Style.RESET_ALL}")
+                    continue
+
+                if ip in connection_failures:
+                    print(
+                        f"{Fore.YELLOW}[INFO] IP {ip} 连接失败： {connection_failures[ip]}{Style.RESET_ALL}")
+                    continue
+
+                output = data[ip].get(
+                    "show ip routing-table vpn __dcn_vpn__", "")
+                dcn_data = item['parser'](output)
+
+                if not dcn_data or dcn_data[0].get("目的网络/掩码") == "无条目":
+                    total_results += 1
+                    normal_results += 1
+                    ws.append([ne_type, device_name, device_ip, "无条目",
+                               "-", "-", "-", "-", "-", "-", "normal", "-"])
+                    for cell in ws[ws.max_row]:
+                        cell.alignment = center_alignment
+                        cell.border = thin_border
+                else:
+                    # 批量写入 - 针对高性能优化
+                    batch_rows = []
+                    has_errors = False
+
+                    for row_data in dcn_data:
+                        total_results += 1
+                        if row_data.get("Result", "normal") == "normal":
+                            normal_results += 1
+                        else:
+                            has_errors = True
+
+                        batch_rows.append([
+                            ne_type, device_name, device_ip,
+                            row_data.get("目的网络/掩码", "-"),
+                            row_data.get("协议", "-"),
+                            row_data.get("优先级", "-"),
+                            row_data.get("开销", "-"),
+                            row_data.get("下一跳", "-"),
+                            row_data.get("接口", "-"),
+                            row_data.get("存活时间", "-"),
+                            row_data.get("Result", "normal"),
+                            row_data.get("备注", "-")
+                        ])
+
+                    # 超快速批量写入
+                    start_row = ws.max_row + 1
+                    for row in batch_rows:
+                        ws.append(row)
+                    end_row = ws.max_row
+
+                    # 只对error行设置样式，大幅提升性能
+                    if has_errors:
+                        red_fill = PatternFill(
+                            start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+                        for row_num in range(start_row, end_row + 1):
+                            row_cells = ws[row_num]
+                            if row_cells[10].value == "error":  # Result列
+                                for cell in row_cells:
+                                    cell.fill = red_fill
+
+                    # 基础样式批量设置
+                    for row_num in range(start_row, end_row + 1):
+                        for cell in ws[row_num]:
+                            cell.alignment = center_alignment
+                            cell.border = thin_border
+
+                    # 合并单元格
+                    if start_row < end_row:
+                        for col in range(1, 4):
+                            ws.merge_cells(start_row=start_row, start_column=col,
+                                           end_row=end_row, end_column=col)
+
+            health_percentage = (
+                normal_results / total_results * 100) if total_results > 0 else 0
+            health_scores[item['sheet_name']] = f"{health_percentage:.0f}%"
+            item_counts[item['sheet_name']] = (normal_results, total_results)
+
+#
     ws_failure = wb.create_sheet(title="登录失败设备")
     headers = ["网元IP", "故障原因"]
     ws_failure.append(headers)
@@ -13063,7 +14566,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "",  # 编号位置，后面会动态填充
             "设备运行时间检查",
             "从历史告警看，网元可能掉电，需持续观察运行状态，或联系设备管理员检查电源稳定性。",
-            "运行时间数据缺失或无法解析，输出 'error'；否则输出 'normal'。",
+            "运行时间数据缺失或无法解析，输出 'error'；否则输出 'normal'、大于1天为'normal'。",
             "show device"
         ],
         "主控盘运行状态": [
@@ -13189,7 +14692,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "",
             "OSPF 路由表检查",
             "若 Cost 值过高，检查 OSPF 链路成本配置或网络拓扑设计；若 Uptime 过短，检查链路稳定性或路由震荡问题。",
-            "Cost > 6000 或 Uptime < 1小时的 OSPF_IA 路由记录为异常，仅输出异常条目，结果为 'normal'。",
+            "Cost > 18000 或 Uptime < 1小时的 OSPF_IA 路由记录为异常，仅输出异常条目，结果为 'normal'。",
             "show ip routing-table"
         ],
         "LDP 会话状态检查": [
@@ -13231,7 +14734,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "",
             "专网业务分析",
             "若专网业务状态为Down，检查VPLS配置、MPLS LDP会话或物理链路；若AC接口状态异常，验证接口VLAN配置。",
-            "VPLS或VC状态为Down时，输出 'error'；AC状态正常，输出 'normal'；无数据输出 'error'。",
+            "VPLS或VC状态为Down时，输出 'error'；AC状态正常，输出 'normal'；数据异常输出 'error'。",
             "show vsi brief"
         ],
         "PTP时钟检查": [
@@ -13262,6 +14765,13 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
             "保护组状态正常则为 'normal'，异常则为 'error'。",
             "show protect-group all; show mpls l2vc brief"
 
+        ],
+        "DCN路由表检查": [
+            "",
+            "DCN路由表检查",
+            "高性能检测DCN VPN路由表中的出厂默认IP（141开头），仅输出异常路由以提升性能。",
+            "仅输出包含141开头IP的异常路由条目，正常路由以汇总形式显示。",
+            "show ip routing-table vpn __dcn_vpn__"
         ],
     }
 
@@ -13442,7 +14952,7 @@ def generate_qa_report(raw_file, report_file, host_file, selected_items):
     # Save workbook
     wb.save(report_file)
     print(
-        f"{Fore.GREEN}[END] 生成 QA 报告: {report_file}{Style.RESET_ALL}")
+        f"{Fore.GREEN}[END] 生成 QA 报告: {report_file}，处理了 {len(successful_host_ips)} 台成功连接的设备{Style.RESET_ALL}")
 
 
 def autofit_worksheet_columns(worksheet):
@@ -13544,7 +15054,7 @@ if __name__ == '__main__':
 
     while True:  # 主循环
         print("\n" + "="*50)
-        print(f"{Fore.CYAN}STN-A设备巡检系统 v2.7{Style.RESET_ALL}".center(50))
+        print(f"{Fore.CYAN}STN-A设备巡检系统 v2.8{Style.RESET_ALL}".center(50))
         print("="*50)
 
         menu = f"""
@@ -13571,7 +15081,6 @@ if __name__ == '__main__':
   2️⃣0️⃣ QA巡检采集           - 质量保证巡检
   2️⃣1️⃣ 添加互联端口描述    - 为OSPF .31接口添加LLDP邻居描述
   0️⃣  退出系统            - 结束程序
-{Fore.GREEN}默认同时连接40台设备。{Style.RESET_ALL}
 {Fore.CYAN}请输入选项：{Style.RESET_ALL}"""
         ucmd = input(menu)
 
@@ -13937,6 +15446,40 @@ if __name__ == '__main__':
             print(
                 f"{Fore.YELLOW}请选择要巡检的项目（输入编号，用逗号分隔，如1,2，或输入以下选项）：{Style.RESET_ALL}")
 
+            # 功能描述映射
+            guide_content_mapping = {
+                "设备运行时间检查": "检查设备持续运行时间，评估电源稳定性和设备运行状态",
+                "主控盘运行状态": "监控主控盘CPU和内存使用情况，确保系统资源正常",
+                "协议报文处理状态": "检查协议处理过程中是否存在丢包，确保数据转发正常",
+                "真实版本信息": "获取设备真实软件版本信息，验证系统固件状态",
+                "风扇转速及温度状态": "监控设备温度和风扇运行状态，确保散热系统正常",
+                "系统与硬件版本状态": "检查系统软件和硬件版本信息完整性",
+                "光模块信息检查": "检测光模块功率、电流、电压等参数，确保光纤链路质量",
+                "电源状态检查": "监控设备各槽位电压状态，确保供电稳定",
+                "FW软件版本一致性检查": "检查主备控制器软件版本是否一致，确保系统可靠性",
+                "板卡CPU内存使用率": "监控各板卡CPU、内存使用率和温度状态",
+                "NTP时间同步分析": "检查设备时间同步状态，确保网络时间准确性",
+                "硬盘资源占用分析": "监控存储空间使用情况，预防存储资源不足",
+                "BFD会话检查(VC业务统计)": "检查BFD双向转发检测会话状态，确保快速故障检测",
+                "配置校验状态": "检查配置校验功能是否启用，确保配置正确性",
+                "OSPF进程状态检查": "监控OSPF路由协议进程运行状态和资源使用情况",
+                "IPFRR-LSP状态检查": "检查MPLS标签交换路径状态，确保IP快速重路由功能",
+                "OSPF邻居状态检查": "检查OSPF邻居关系建立和维护状态",
+                "LACP成员状态监控": "监控链路聚合控制协议成员端口状态",
+                "OSPF 路由表检查": "检查OSPF路由表条目成本值和稳定性",
+                "LDP 会话状态检查": "检查标签分发协议会话建立和运行状态",
+                "Loopback31地址唯一性检查": "验证Loopback31接口IP地址在网络中的唯一性",
+                "Loopback1023地址唯一性检查": "验证Loopback1023接口IP地址在网络中的唯一性",
+                "SNMP配置检查": "检查SNMP协议版本和安全配置合规性",
+                "设备账户检查": "检查设备登录账户安全策略配置",
+                "专网业务分析": "检查VPLS专网业务运行状态和接口配置",
+                "PTP时钟检查": "检查精确时间协议同步状态和时钟配置",
+                "站点邻接网元检查": "检查LDP邻接关系和站点间网元连接状态",
+                "设备面板视图": "以图形化方式展示设备槽位和板卡物理布局",
+                "BFD保护组状态信息": "检查BFD保护组配置和L2VC业务关联状态",
+                "DCN路由表检查": "检查DCN VPN路由表，识别出厂默认IP配置的设备"
+            }
+
             inspection_items = {
                 "1": {
                     "name": "设备运行时间检查",
@@ -14141,9 +15684,14 @@ if __name__ == '__main__':
                     "parser": parse_protect_group_all,
                     "sheet_name": "BFD保护组状态信息",
                     "category": "冗余与容灾"
-                }
-
-
+                },
+                "30": {
+                    "name": "DCN路由表检查",
+                    "command": "show ip routing-table vpn __dcn_vpn__",
+                    "parser": parse_dcn_routing_table,
+                    "sheet_name": "DCN路由表检查",
+                    "category": "路由协议健康度"
+                },
             }
 
             # Group items by category for display
@@ -14158,36 +15706,53 @@ if __name__ == '__main__':
                 "基础安全配置": [item for item in inspection_items.values() if item["category"] == "基础安全配置"]
             }
 
-            # Display categories and items
+            # Display categories and items with descriptions
             for category, items in categories.items():
-                print(f"\n{Fore.CYAN}{category}{Style.RESET_ALL}:")
+                print(f"\n{Fore.CYAN}━━━ {category} ━━━{Style.RESET_ALL}")
                 for key, item in inspection_items.items():
                     if item["category"] == category:
-                        print(f"{key}. {item['name']}")
-            print(f"\n{Fore.YELLOW}-----{Style.RESET_ALL}")
-            print("0. 返回主菜单")
-            print("00. 执行全量巡检")
-            print("000. QA文件清洗（仅清洗已有qa_wash_raw.txt数据）")
+                        description = guide_content_mapping.get(
+                            item['name'], "功能描述暂未提供")
+                        print(
+                            f"{Fore.WHITE}{key:>2}.{Style.RESET_ALL} {Fore.GREEN}{item['name']}{Style.RESET_ALL}")
+                        print(
+                            f"     {Fore.LIGHTBLACK_EX}▸ {description}{Style.RESET_ALL}")
+
+            print(
+                f"\n{Fore.YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}默认同时连接40台设备。{Style.RESET_ALL}")
+            print(f"{Fore.MAGENTA} 0.{Style.RESET_ALL}  返回主菜单")
+            print(f"{Fore.MAGENTA}00.{Style.RESET_ALL}  执行全量巡检（包含所有30项检查）")
+            print(
+                f"{Fore.MAGENTA}000.{Style.RESET_ALL} QA文件清洗（仅清洗已有qa_wash_raw.txt数据）")
 
             # Get user selection
-            selection = input(f"{Fore.CYAN}请输入选项：{Style.RESET_ALL}")
+            selection = input(f"\n{Fore.CYAN}请输入选项：{Style.RESET_ALL}")
             if selection == '0':
                 continue
             elif selection == '000':
                 # QA文件清洗模式
                 print(
-                    f"{Fore.GREEN}[INFO] 触发QA文件清洗模式，仅处理已有数据{Style.RESET_ALL}")
+                    f"\n{Fore.GREEN}[INFO] 触发QA文件清洗模式，仅处理已有数据{Style.RESET_ALL}")
                 raw_file = getinput("qa_wash_raw.txt",
                                     "原始数据文件（默认：qa_wash_raw.txt）：")
                 host_file = getinput(
                     "host-stna.csv", "设备清单（默认：host-stna.csv）：")
                 report_file = f"QA巡检报告-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"
+
                 # 询问用户选择巡检项
                 print(
-                    f"{Fore.YELLOW}请选择要清洗的巡检项目（输入编号，用逗号分隔，如1,2，或输入00清洗所有项目）：{Style.RESET_ALL}")
-                for key, item in inspection_items.items():
-                    print(f"{key}. {item['name']}")
-                print("00. 清洗所有巡检项目")
+                    f"\n{Fore.YELLOW}请选择要清洗的巡检项目（输入编号，用逗号分隔，如1,2，或输入00清洗所有项目）：{Style.RESET_ALL}")
+
+                # 按分类显示巡检项目选择列表
+                for category, items in categories.items():
+                    print(f"\n{Fore.CYAN}{category}:{Style.RESET_ALL}")
+                    for key, item in inspection_items.items():
+                        if item["category"] == category:
+                            print(f"{key}. {item['name']}")
+
+                print(f"\n{Fore.MAGENTA}00. 清洗所有巡检项目{Style.RESET_ALL}")
+
                 clean_selection = input(f"{Fore.CYAN}请输入选项：{Style.RESET_ALL}")
                 if clean_selection == '00':
                     selected_items = list(inspection_items.values())
@@ -14199,6 +15764,7 @@ if __name__ == '__main__':
                     if not selected_items:
                         print(f"{Fore.RED}[ERROR] 未选择任何巡检项目{Style.RESET_ALL}")
                         continue
+
                 # 直接调用generate_qa_report进行数据清洗和报告生成
                 generate_qa_report(raw_file, report_file,
                                    host_file, selected_items)
@@ -14279,6 +15845,8 @@ if __name__ == '__main__':
                     commands.append("show protect-group all")
                     commands.append("show mpls l2vc brief")
                     commands.append("show interface loopback 31")
+                if any(item['name'] == "DCN路由表检查" for item in selected_items):
+                    commands.extend(["show ip routing-table vpn __dcn_vpn__"])
                 commands.append("show device")
 
                 # 去除重复项

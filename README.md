@@ -9,6 +9,11 @@ AUTO-STN是一个用于网络设备自动化巡检的工具，专为STN-A设备�
 ### 最新更新
 - 增强功能BFD会话检查(VC业务统计)
 - 修复若干BUG
+- 修改最大连接数为40
+- 新增巡检功能28设备面板视图
+- 新增功能21自动设置互联端口描述
+- 新增QA巡检子功能-BFD保护组状态信息
+- 新增QA巡检子功能-DCN路由表检查
 
 ## 安装指南
 
@@ -32,7 +37,7 @@ pip install openpyxl pytz paramiko tqdm colorama
 ### 1. 运行程序
 
 ```bash
-python engineerl-V2.6.py
+python engineerl-V2.7.py
 ```
 
 ### 2. 配置文件说明
